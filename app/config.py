@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     patient_record_cache_ttl_seconds: int = 600
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-2.5-flash"
+    gemini_temperature: float = 0.1
+    gemini_max_output_tokens: int = 4096
+    gemini_thinking_budget: int = 0
+    gemini_file_search_top_k: int = 10
+    gemini_file_search_chunk_max_tokens: int = 512
+    gemini_file_search_chunk_overlap_tokens: int = 100
+    gemini_file_search_log_retrieval: bool = True
     gemini_context_cache_ttl_hours: int = 24
 
     model_config = SettingsConfigDict(

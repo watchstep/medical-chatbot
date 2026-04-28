@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover - optional dependency guard
 
 from app.config import Settings
 from app.prompts.gemini_qa import (
+    build_gemini_qa_context_note,
     build_gemini_qa_question_prompt,
     build_gemini_qa_system_instruction,
 )
@@ -101,6 +102,8 @@ class GeminiGateway:
         file_search_store_name: str,
         document: GeminiDocument,
         custom_metadata: dict[str, str],
+        chunk_max_tokens: int | None = None,
+        chunk_overlap_tokens: int | None = None,
     ) -> str:
         raise NotImplementedError
 
@@ -117,6 +120,11 @@ class GeminiGateway:
         system_instruction: str,
         prompt: str,
         file_search_store_name: str,
+        temperature: float,
+        max_output_tokens: int,
+        thinking_budget: int | None,
+        file_search_top_k: int,
+        log_retrieval: bool,
     ) -> str:
         raise NotImplementedError
 
@@ -399,6 +407,8 @@ class GoogleGeminiGateway(GeminiGateway):
         file_search_store_name: str,
         document: GeminiDocument,
         custom_metadata: dict[str, str],
+        chunk_max_tokens: int | None = None,
+        chunk_overlap_tokens: int | None = None,
     ) -> str:
         metadata = self._sanitize_custom_metadata(custom_metadata)
         self._validate_document_before_upload(document)
@@ -425,6 +435,8 @@ class GoogleGeminiGateway(GeminiGateway):
                 temp_path=temp_path,
                 display_name=document.name,
                 custom_metadata=metadata,
+                chunk_max_tokens=chunk_max_tokens,
+                chunk_overlap_tokens=chunk_overlap_tokens,
             )
             operation = self._wait_for_operation(operation)
 
@@ -495,6 +507,11 @@ class GoogleGeminiGateway(GeminiGateway):
         system_instruction: str,
         prompt: str,
         file_search_store_name: str,
+        temperature: float,
+        max_output_tokens: int,
+        thinking_budget: int | None,
+        file_search_top_k: int,
+        log_retrieval: bool,
     ) -> str:
         try:
             logger.info(
@@ -509,22 +526,132 @@ class GoogleGeminiGateway(GeminiGateway):
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                     tools=[
-                        types.Tool(
-                            file_search=types.FileSearch(
-                                file_search_store_names=[file_search_store_name]
-                            )
+                        self._build_file_search_tool(
+                            file_search_store_name=file_search_store_name,
+                            top_k=file_search_top_k,
                         )
                     ],
-                    temperature=0.1,
-                    max_output_tokens=700,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_budget=thinking_budget,
+                    )
+                    if thinking_budget is not None
+                    else None,
                 ),
             )
         except Exception as exc:
             raise GeminiQaError("Gemini 답변 생성에 실패했습니다.") from exc
+        self._log_generate_response_diagnostics(
+            response=response,
+            file_search_store_name=file_search_store_name,
+            log_retrieval=log_retrieval,
+        )
         text = getattr(response, "text", "") or ""
         if not text:
             raise GeminiQaError("Gemini 응답이 비어 있습니다.")
         return text
+
+    def _log_generate_response_diagnostics(
+        self,
+        *,
+        response: Any,
+        file_search_store_name: str,
+        log_retrieval: bool,
+    ) -> None:
+        candidates = self._object_get(response, "candidates", []) or []
+        candidate = candidates[0] if candidates else None
+        finish_reason = self._normalize_finish_reason(
+            self._object_get(candidate, "finish_reason", None)
+        )
+        finish_message = self._object_get(candidate, "finish_message", "") or ""
+        token_count = self._object_get(candidate, "token_count", None)
+        usage_metadata = self._object_get(response, "usage_metadata", None)
+        prompt_token_count = self._object_get(usage_metadata, "prompt_token_count", None)
+        candidates_token_count = self._object_get(usage_metadata, "candidates_token_count", None)
+        total_token_count = self._object_get(usage_metadata, "total_token_count", None)
+
+        log_method = logger.warning if finish_reason == "MAX_TOKENS" else logger.info
+        log_method(
+            "Gemini QA response diagnostics store=%s finish_reason=%s finish_message=%s "
+            "candidate_token_count=%s prompt_token_count=%s candidates_token_count=%s total_token_count=%s",
+            file_search_store_name,
+            finish_reason or "",
+            finish_message,
+            token_count,
+            prompt_token_count,
+            candidates_token_count,
+            total_token_count,
+        )
+
+        if not log_retrieval:
+            return
+        grounding_metadata = self._object_get(candidate, "grounding_metadata", None)
+        self._log_grounding_metadata(
+            grounding_metadata=grounding_metadata,
+            file_search_store_name=file_search_store_name,
+        )
+
+    def _log_grounding_metadata(
+        self,
+        *,
+        grounding_metadata: Any,
+        file_search_store_name: str,
+    ) -> None:
+        grounding_chunks = self._object_get(grounding_metadata, "grounding_chunks", []) or []
+        grounding_supports = self._object_get(grounding_metadata, "grounding_supports", []) or []
+        logger.info(
+            "Gemini File Search retrieval summary store=%s grounding_chunks=%s grounding_supports=%s",
+            file_search_store_name,
+            len(grounding_chunks),
+            len(grounding_supports),
+        )
+
+        for index, chunk in enumerate(grounding_chunks):
+            retrieved_context = self._object_get(chunk, "retrieved_context", None)
+            rag_chunk = self._object_get(retrieved_context, "rag_chunk", None)
+            page_span = self._object_get(rag_chunk, "page_span", None)
+            custom_metadata = self._parse_custom_metadata(
+                self._object_get(retrieved_context, "custom_metadata", []) or []
+            )
+            logger.info(
+                "Gemini File Search retrieved chunk index=%s store=%s document_name=%s title=%s "
+                "uri=%s file_search_store=%s first_page=%s last_page=%s custom_metadata=%s text_logged=%s",
+                index,
+                file_search_store_name,
+                self._object_get(retrieved_context, "document_name", "") or "",
+                self._object_get(retrieved_context, "title", "") or "",
+                self._object_get(retrieved_context, "uri", "") or "",
+                self._object_get(retrieved_context, "file_search_store", "") or "",
+                self._object_get(page_span, "first_page", None),
+                self._object_get(page_span, "last_page", None),
+                custom_metadata,
+                False,
+            )
+
+        for index, support in enumerate(grounding_supports):
+            chunk_indices = self._object_get(support, "grounding_chunk_indices", None)
+            confidence_scores = self._object_get(support, "confidence_scores", None)
+            logger.info(
+                "Gemini File Search grounding support index=%s store=%s grounding_chunk_indices=%s "
+                "confidence_scores=%s score_unavailable=%s",
+                index,
+                file_search_store_name,
+                chunk_indices or [],
+                confidence_scores or [],
+                not bool(confidence_scores),
+            )
+
+    def _normalize_finish_reason(self, finish_reason: Any) -> str:
+        if finish_reason is None:
+            return ""
+        value = getattr(finish_reason, "value", None)
+        if value:
+            return str(value)
+        name = getattr(finish_reason, "name", None)
+        if name:
+            return str(name)
+        return str(finish_reason)
 
     def _wait_for_operation(self, operation: Any) -> Any:
         for _ in range(FILE_SEARCH_OPERATION_MAX_ATTEMPTS):
@@ -561,6 +688,8 @@ class GoogleGeminiGateway(GeminiGateway):
         temp_path: str,
         display_name: str,
         custom_metadata: dict[str, str],
+        chunk_max_tokens: int | None = None,
+        chunk_overlap_tokens: int | None = None,
     ) -> Any:
         """Uploads a local file directly into a File Search Store.
 
@@ -579,6 +708,8 @@ class GoogleGeminiGateway(GeminiGateway):
                 display_name=display_name,
                 mime_type=mime_type,
                 custom_metadata=metadata,
+                chunk_max_tokens=chunk_max_tokens,
+                chunk_overlap_tokens=chunk_overlap_tokens,
             )
         except Exception:
             logger.warning(
@@ -590,10 +721,17 @@ class GoogleGeminiGateway(GeminiGateway):
 
         if hasattr(self.client.file_search_stores, "upload_to_file_search_store"):
             try:
+                config: dict[str, object] = {"display_name": display_name}
+                chunking_config = self._build_dict_chunking_config(
+                    max_tokens_per_chunk=chunk_max_tokens,
+                    max_overlap_tokens=chunk_overlap_tokens,
+                )
+                if chunking_config:
+                    config["chunking_config"] = chunking_config
                 return self.client.file_search_stores.upload_to_file_search_store(
                     file_search_store_name=file_search_store_name,
                     file=temp_path,
-                    config={"display_name": display_name},
+                    config=config,
                 )
             except Exception:
                 logger.warning(
@@ -614,6 +752,8 @@ class GoogleGeminiGateway(GeminiGateway):
             file_search_store_name=file_search_store_name,
             file_name=uploaded_file_name,
             custom_metadata=metadata,
+            chunk_max_tokens=chunk_max_tokens,
+            chunk_overlap_tokens=chunk_overlap_tokens,
         )
 
     def _import_file_to_store(
@@ -622,15 +762,22 @@ class GoogleGeminiGateway(GeminiGateway):
         file_search_store_name: str,
         file_name: str,
         custom_metadata: dict[str, str],
+        chunk_max_tokens: int | None = None,
+        chunk_overlap_tokens: int | None = None,
     ) -> Any:
         metadata = self._sanitize_custom_metadata(custom_metadata)
         if metadata:
             try:
+                typed_chunking_config = self._build_typed_chunking_config(
+                    max_tokens_per_chunk=chunk_max_tokens,
+                    max_overlap_tokens=chunk_overlap_tokens,
+                )
                 return self.client.file_search_stores.import_file(
                     file_search_store_name=file_search_store_name,
                     file_name=file_name,
                     config=types.ImportFileConfig(
-                        custom_metadata=self._build_typed_custom_metadata(metadata)
+                        custom_metadata=self._build_typed_custom_metadata(metadata),
+                        chunking_config=typed_chunking_config,
                     ),
                 )
             except Exception:
@@ -641,6 +788,16 @@ class GoogleGeminiGateway(GeminiGateway):
                     exc_info=True,
                 )
         try:
+            typed_chunking_config = self._build_typed_chunking_config(
+                max_tokens_per_chunk=chunk_max_tokens,
+                max_overlap_tokens=chunk_overlap_tokens,
+            )
+            if typed_chunking_config is not None:
+                return self.client.file_search_stores.import_file(
+                    file_search_store_name=file_search_store_name,
+                    file_name=file_name,
+                    config=types.ImportFileConfig(chunking_config=typed_chunking_config),
+                )
             return self.client.file_search_stores.import_file(
                 file_search_store_name=file_search_store_name,
                 file_name=file_name,
@@ -656,6 +813,8 @@ class GoogleGeminiGateway(GeminiGateway):
             file_search_store_name=file_search_store_name,
             file_name=file_name,
             custom_metadata=metadata,
+            chunk_max_tokens=chunk_max_tokens,
+            chunk_overlap_tokens=chunk_overlap_tokens,
         )
 
     def _upload_to_file_search_store_rest(
@@ -666,6 +825,8 @@ class GoogleGeminiGateway(GeminiGateway):
         display_name: str,
         mime_type: str,
         custom_metadata: dict[str, str],
+        chunk_max_tokens: int | None = None,
+        chunk_overlap_tokens: int | None = None,
     ) -> dict[str, Any]:
         metadata = self._sanitize_custom_metadata(custom_metadata)
         body: dict[str, Any] = {
@@ -674,6 +835,12 @@ class GoogleGeminiGateway(GeminiGateway):
         }
         if metadata:
             body["customMetadata"] = self._build_rest_custom_metadata(metadata)
+        chunking_config = self._build_rest_chunking_config(
+            max_tokens_per_chunk=chunk_max_tokens,
+            max_overlap_tokens=chunk_overlap_tokens,
+        )
+        if chunking_config:
+            body["chunkingConfig"] = chunking_config
 
         try:
             return self._post_upload_to_file_search_store_rest(
@@ -700,6 +867,7 @@ class GoogleGeminiGateway(GeminiGateway):
                 metadata_body={
                     "displayName": display_name,
                     "mimeType": mime_type,
+                    **({"chunkingConfig": chunking_config} if chunking_config else {}),
                 },
             )
 
@@ -799,11 +967,19 @@ class GoogleGeminiGateway(GeminiGateway):
         file_search_store_name: str,
         file_name: str,
         custom_metadata: dict[str, str],
+        chunk_max_tokens: int | None = None,
+        chunk_overlap_tokens: int | None = None,
     ) -> dict[str, Any]:
         metadata = self._sanitize_custom_metadata(custom_metadata)
         body: dict[str, Any] = {"fileName": file_name}
         if metadata:
             body["customMetadata"] = self._build_rest_custom_metadata(metadata)
+        chunking_config = self._build_rest_chunking_config(
+            max_tokens_per_chunk=chunk_max_tokens,
+            max_overlap_tokens=chunk_overlap_tokens,
+        )
+        if chunking_config:
+            body["chunkingConfig"] = chunking_config
 
         try:
             return self._post_import_file_rest(
@@ -821,7 +997,10 @@ class GoogleGeminiGateway(GeminiGateway):
             )
             return self._post_import_file_rest(
                 file_search_store_name=file_search_store_name,
-                body={"fileName": file_name},
+                body={
+                    "fileName": file_name,
+                    **({"chunkingConfig": chunking_config} if chunking_config else {}),
+                },
             )
 
     def _post_import_file_rest(
@@ -926,16 +1105,127 @@ class GoogleGeminiGateway(GeminiGateway):
     def _redact_api_key_from_url(self, url: str) -> str:
         return re.sub(r"([?&]key=)[^&]+", r"\1***", url)
 
+    def _build_file_search_tool(
+        self,
+        *,
+        file_search_store_name: str,
+        top_k: int,
+    ) -> Any:
+        file_search_kwargs: dict[str, Any] = {
+            "file_search_store_names": [file_search_store_name],
+        }
+        if top_k > 0:
+            file_search_kwargs["top_k"] = top_k
+        return types.Tool(
+            file_search=types.FileSearch(**file_search_kwargs)
+        )
+
     def _build_rest_custom_metadata(self, custom_metadata: dict[str, str]) -> list[dict[str, str]]:
         return [
             {"key": key, "stringValue": value}
             for key, value in self._sanitize_custom_metadata(custom_metadata).items()
         ]
 
+    def _build_rest_chunking_config(
+        self,
+        *,
+        max_tokens_per_chunk: int | None,
+        max_overlap_tokens: int | None,
+    ) -> dict[str, Any] | None:
+        max_tokens_per_chunk, max_overlap_tokens = self._normalize_chunking_config_values(
+            max_tokens_per_chunk=max_tokens_per_chunk,
+            max_overlap_tokens=max_overlap_tokens,
+        )
+        if max_tokens_per_chunk is None and max_overlap_tokens is None:
+            return None
+        white_space_config: dict[str, int] = {}
+        if max_tokens_per_chunk is not None:
+            white_space_config["maxTokensPerChunk"] = max_tokens_per_chunk
+        if max_overlap_tokens is not None:
+            white_space_config["maxOverlapTokens"] = max_overlap_tokens
+        return {"whiteSpaceConfig": white_space_config}
+
+    def _build_dict_chunking_config(
+        self,
+        *,
+        max_tokens_per_chunk: int | None,
+        max_overlap_tokens: int | None,
+    ) -> dict[str, Any] | None:
+        max_tokens_per_chunk, max_overlap_tokens = self._normalize_chunking_config_values(
+            max_tokens_per_chunk=max_tokens_per_chunk,
+            max_overlap_tokens=max_overlap_tokens,
+        )
+        if max_tokens_per_chunk is None and max_overlap_tokens is None:
+            return None
+        white_space_config: dict[str, int] = {}
+        if max_tokens_per_chunk is not None:
+            white_space_config["max_tokens_per_chunk"] = max_tokens_per_chunk
+        if max_overlap_tokens is not None:
+            white_space_config["max_overlap_tokens"] = max_overlap_tokens
+        return {"white_space_config": white_space_config}
+
+    def _build_typed_chunking_config(
+        self,
+        *,
+        max_tokens_per_chunk: int | None,
+        max_overlap_tokens: int | None,
+    ) -> Any | None:
+        max_tokens_per_chunk, max_overlap_tokens = self._normalize_chunking_config_values(
+            max_tokens_per_chunk=max_tokens_per_chunk,
+            max_overlap_tokens=max_overlap_tokens,
+        )
+        if max_tokens_per_chunk is None and max_overlap_tokens is None:
+            return None
+        return types.ChunkingConfig(
+            white_space_config=types.WhiteSpaceConfig(
+                max_tokens_per_chunk=max_tokens_per_chunk,
+                max_overlap_tokens=max_overlap_tokens,
+            )
+        )
+
+    def _normalize_chunking_config_values(
+        self,
+        *,
+        max_tokens_per_chunk: int | None,
+        max_overlap_tokens: int | None,
+    ) -> tuple[int | None, int | None]:
+        if max_tokens_per_chunk is not None and max_tokens_per_chunk <= 0:
+            max_tokens_per_chunk = None
+        if max_overlap_tokens is not None and max_overlap_tokens < 0:
+            max_overlap_tokens = None
+        if max_tokens_per_chunk is not None and max_tokens_per_chunk > 512:
+            logger.warning(
+                "Gemini File Search chunk max tokens exceeds API limit; clamping requested=%s applied=512",
+                max_tokens_per_chunk,
+            )
+            max_tokens_per_chunk = 512
+        if (
+            max_tokens_per_chunk is not None
+            and max_overlap_tokens is not None
+            and max_overlap_tokens > max_tokens_per_chunk
+        ):
+            logger.warning(
+                "Gemini File Search chunk overlap exceeds chunk size; clamping requested=%s applied=%s",
+                max_overlap_tokens,
+                max_tokens_per_chunk,
+            )
+            max_overlap_tokens = max_tokens_per_chunk
+        return max_tokens_per_chunk, max_overlap_tokens
+
     def _operation_get(self, operation: Any, key: str, default: Any = None) -> Any:
         if isinstance(operation, dict):
             return operation.get(key, default)
         return getattr(operation, key, default)
+
+    def _object_get(self, item: Any, key: str, default: Any = None) -> Any:
+        if item is None:
+            return default
+        if isinstance(item, dict):
+            if key in item:
+                return item[key]
+            camel_key = re.sub(r"_([a-z])", lambda match: match.group(1).upper(), key)
+            return item.get(camel_key, default)
+        return getattr(item, key, default)
 
     def _escape_multipart_filename(self, filename: str) -> str:
         return filename.replace("\\", "_").replace('"', "_").replace("\r", "_").replace("\n", "_")
@@ -1084,13 +1374,23 @@ class GeminiQaService:
         system_instruction = build_gemini_qa_system_instruction(
             document_descriptions=document_descriptions,
         )
-        prompt = build_gemini_qa_question_prompt(question=question)
+        prompt = "\n\n".join(
+            [
+                build_gemini_qa_context_note(document_descriptions=document_descriptions),
+                build_gemini_qa_question_prompt(question=question),
+            ]
+        )
         try:
             return self.gateway.generate_answer(
                 model=self.settings.gemini_model,
                 system_instruction=system_instruction,
                 prompt=prompt,
                 file_search_store_name=context.file_search_store_name,
+                temperature=self.settings.gemini_temperature,
+                max_output_tokens=self.settings.gemini_max_output_tokens,
+                thinking_budget=self.settings.gemini_thinking_budget,
+                file_search_top_k=self.settings.gemini_file_search_top_k,
+                log_retrieval=self.settings.gemini_file_search_log_retrieval,
             )
         except GeminiQaError:
             raise
@@ -1102,10 +1402,18 @@ class GeminiQaService:
         return "\n".join(
             (
                 f"- {document.filename} "
-                f"({document.document_type or '문서'}, {document.document_date or '날짜 미상'})"
+                f"({self._document_type_label(document.document_type)}, "
+                f"문서 날짜: {document.document_date or '날짜 미상'})"
             )
             for document in documents
         )
+
+    def _document_type_label(self, document_type: str) -> str:
+        return {
+            "result": "검사결과지",
+            "chart": "진료기록부",
+            "image": "영상 판독 문서",
+        }.get(document_type, "기타 진단 기록")
 
 
 @dataclass
@@ -1154,6 +1462,8 @@ class GeminiPatientStoreSyncService:
                 "document_date": document_entry.document_date,
                 "drive_file_id": document_entry.drive_file_id,
             },
+            chunk_max_tokens=self.settings.gemini_file_search_chunk_max_tokens,
+            chunk_overlap_tokens=self.settings.gemini_file_search_chunk_overlap_tokens,
         )
 
     def upsert_drive_pdf_document(
@@ -1215,6 +1525,8 @@ class GeminiPatientStoreSyncService:
                     "document_date": document_date,
                     "drive_file_id": drive_file_id,
                 },
+                chunk_max_tokens=self.settings.gemini_file_search_chunk_max_tokens,
+                chunk_overlap_tokens=self.settings.gemini_file_search_chunk_overlap_tokens,
             )
             document_names.append(document_name)
         return document_names

@@ -28,7 +28,7 @@ class FakeGeminiGateway(GeminiGateway):
         self.raise_error: Exception | None = None
         self.created_stores: list[str] = []
         self.import_calls: list[dict[str, object]] = []
-        self.generate_calls: list[dict[str, str]] = []
+        self.generate_calls: list[dict[str, object]] = []
         self.deleted_documents: list[str] = []
         self.documents_by_store: dict[str, list[FileSearchStoreDocument]] = {}
 
@@ -44,12 +44,16 @@ class FakeGeminiGateway(GeminiGateway):
         file_search_store_name: str,
         document: GeminiDocument,
         custom_metadata: dict[str, str],
+        chunk_max_tokens: int | None = None,
+        chunk_overlap_tokens: int | None = None,
     ) -> str:
         self.import_calls.append(
             {
                 "file_search_store_name": file_search_store_name,
                 "document": document,
                 "custom_metadata": custom_metadata,
+                "chunk_max_tokens": chunk_max_tokens,
+                "chunk_overlap_tokens": chunk_overlap_tokens,
             }
         )
         documents = [
@@ -88,6 +92,11 @@ class FakeGeminiGateway(GeminiGateway):
         system_instruction: str,
         prompt: str,
         file_search_store_name: str,
+        temperature: float,
+        max_output_tokens: int,
+        thinking_budget: int | None,
+        file_search_top_k: int,
+        log_retrieval: bool,
     ) -> str:
         self.generate_calls.append(
             {
@@ -95,6 +104,11 @@ class FakeGeminiGateway(GeminiGateway):
                 "system_instruction": system_instruction,
                 "prompt": prompt,
                 "file_search_store_name": file_search_store_name,
+                "temperature": temperature,
+                "max_output_tokens": max_output_tokens,
+                "thinking_budget": thinking_budget,
+                "file_search_top_k": file_search_top_k,
+                "log_retrieval": log_retrieval,
             }
         )
         if self.raise_error is not None:
@@ -108,6 +122,13 @@ class GeminiQaServiceTest(unittest.TestCase):
             google_service_account_path="credentials/google-service-account.json",
             gemini_api_key="test-key",
             gemini_model="gemini-test-model",
+            gemini_temperature=0.1,
+            gemini_max_output_tokens=700,
+            gemini_thinking_budget=0,
+            gemini_file_search_top_k=5,
+            gemini_file_search_chunk_max_tokens=512,
+            gemini_file_search_chunk_overlap_tokens=100,
+            gemini_file_search_log_retrieval=True,
         )
         self.gateway = FakeGeminiGateway()
         self.qa_service = GeminiQaService(settings=self.settings, gateway=self.gateway)
@@ -130,8 +151,43 @@ class GeminiQaServiceTest(unittest.TestCase):
             "fileSearchStores/patient-P0001",
         )
         self.assertIn("당신은 의료 문서 기반 질의응답 도우미입니다", self.gateway.generate_calls[0]["system_instruction"])
-        self.assertIn("result_20260421.pdf", self.gateway.generate_calls[0]["system_instruction"])
+        self.assertIn("아래 PDF 파일들은 동일 환자의 최신 진단 기록입니다.", self.gateway.generate_calls[0]["prompt"])
+        self.assertIn("result_20260421.pdf (검사결과지, 문서 날짜: 20260421)", self.gateway.generate_calls[0]["prompt"])
+        self.assertIn("chart_20260421.pdf (진료기록부, 문서 날짜: 20260421)", self.gateway.generate_calls[0]["prompt"])
+        self.assertIn("근거 문서 표시 규칙", self.gateway.generate_calls[0]["prompt"])
         self.assertIn("사용자 질문", self.gateway.generate_calls[0]["prompt"])
+        self.assertEqual(self.gateway.generate_calls[0]["temperature"], 0.1)
+        self.assertEqual(self.gateway.generate_calls[0]["max_output_tokens"], 700)
+        self.assertEqual(self.gateway.generate_calls[0]["thinking_budget"], 0)
+        self.assertEqual(self.gateway.generate_calls[0]["file_search_top_k"], 5)
+        self.assertTrue(self.gateway.generate_calls[0]["log_retrieval"])
+
+    def test_answer_question_uses_configured_generation_options(self) -> None:
+        qa_service = GeminiQaService(
+            settings=Settings(
+                google_service_account_path="credentials/google-service-account.json",
+                gemini_api_key="test-key",
+                gemini_model="gemini-test-model",
+                gemini_temperature=0.2,
+                gemini_max_output_tokens=1024,
+                gemini_thinking_budget=256,
+                gemini_file_search_top_k=7,
+                gemini_file_search_log_retrieval=False,
+            ),
+            gateway=self.gateway,
+        )
+        context = self._build_context(store_name="fileSearchStores/patient-P0001")
+
+        qa_service.answer_question(
+            question="이번 기록에서 혈액검사 이상이 있나요?",
+            context=context,
+        )
+
+        self.assertEqual(self.gateway.generate_calls[0]["temperature"], 0.2)
+        self.assertEqual(self.gateway.generate_calls[0]["max_output_tokens"], 1024)
+        self.assertEqual(self.gateway.generate_calls[0]["thinking_budget"], 256)
+        self.assertEqual(self.gateway.generate_calls[0]["file_search_top_k"], 7)
+        self.assertFalse(self.gateway.generate_calls[0]["log_retrieval"])
 
     def test_answer_question_raises_when_store_name_missing(self) -> None:
         context = self._build_context(store_name="")
@@ -194,6 +250,8 @@ class GeminiQaServiceTest(unittest.TestCase):
             self.gateway.import_calls[0]["custom_metadata"]["patient_id"],
             "P0001",
         )
+        self.assertEqual(self.gateway.import_calls[0]["chunk_max_tokens"], 512)
+        self.assertEqual(self.gateway.import_calls[0]["chunk_overlap_tokens"], 100)
 
     def test_upsert_document_deletes_previous_document_before_reimport(self) -> None:
         self.gateway.documents_by_store["fileSearchStores/patient-P0001"] = [
@@ -358,6 +416,7 @@ class FakeOperationsApi:
 class FakeModelsApi:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.next_response: object | None = None
 
     def generate_content(self, *, model: str, contents: str, config: object):
         self.calls.append(
@@ -367,6 +426,8 @@ class FakeModelsApi:
                 "config": config,
             }
         )
+        if self.next_response is not None:
+            return self.next_response
         return SimpleNamespace(text="답변")
 
 
@@ -641,6 +702,11 @@ class GoogleGeminiGatewayTest(unittest.TestCase):
             system_instruction="시스템 지시",
             prompt="질문",
             file_search_store_name="fileSearchStores/patient-P0001",
+            temperature=0.2,
+            max_output_tokens=1024,
+            thinking_budget=0,
+            file_search_top_k=7,
+            log_retrieval=True,
         )
 
         self.assertEqual(answer, "답변")
@@ -650,7 +716,128 @@ class GoogleGeminiGatewayTest(unittest.TestCase):
             config["tools"][0]["file_search"]["file_search_store_names"],
             ["fileSearchStores/patient-P0001"],
         )
+        self.assertEqual(config["tools"][0]["file_search"]["top_k"], 7)
         self.assertEqual(config["system_instruction"], "시스템 지시")
+        self.assertEqual(config["temperature"], 0.2)
+        self.assertEqual(config["max_output_tokens"], 1024)
+        self.assertEqual(config["thinking_config"].thinking_budget, 0)
+
+    def test_generate_answer_logs_finish_reason_and_retrieval_metadata_without_chunk_text(self) -> None:
+        self.models.next_response = SimpleNamespace(
+            text="답변",
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=100,
+                candidates_token_count=70,
+                total_token_count=170,
+            ),
+            candidates=[
+                SimpleNamespace(
+                    finish_reason="MAX_TOKENS",
+                    finish_message="token limit",
+                    token_count=70,
+                    grounding_metadata=SimpleNamespace(
+                        grounding_chunks=[
+                            SimpleNamespace(
+                                retrieved_context=SimpleNamespace(
+                                    document_name="fileSearchStores/patient-P0001/documents/result-new",
+                                    title="result_20260421.pdf",
+                                    uri="gemini://result",
+                                    file_search_store="fileSearchStores/patient-P0001",
+                                    rag_chunk=SimpleNamespace(
+                                        page_span=SimpleNamespace(first_page=2, last_page=3),
+                                        text="민감한 PDF 원문 chunk",
+                                    ),
+                                    text="민감한 retrieved context",
+                                    custom_metadata=[
+                                        SimpleNamespace(
+                                            key="drive_file_id",
+                                            string_value="result-new",
+                                            numeric_value=None,
+                                        )
+                                    ],
+                                )
+                            )
+                        ],
+                        grounding_supports=[
+                            SimpleNamespace(
+                                grounding_chunk_indices=[0],
+                                confidence_scores=[0.83],
+                            )
+                        ],
+                    ),
+                )
+            ],
+        )
+
+        with self.assertLogs("app.services.gemini_qa", level="INFO") as logs:
+            answer = self.gateway.generate_answer(
+                model="gemini-2.5-flash",
+                system_instruction="시스템 지시",
+                prompt="질문",
+                file_search_store_name="fileSearchStores/patient-P0001",
+                temperature=0.2,
+                max_output_tokens=700,
+                thinking_budget=0,
+                file_search_top_k=5,
+                log_retrieval=True,
+            )
+
+        log_output = "\n".join(logs.output)
+        self.assertEqual(answer, "답변")
+        self.assertIn("finish_reason=MAX_TOKENS", log_output)
+        self.assertIn("grounding_chunks=1", log_output)
+        self.assertIn("document_name=fileSearchStores/patient-P0001/documents/result-new", log_output)
+        self.assertIn("confidence_scores=[0.83]", log_output)
+        self.assertNotIn("민감한 PDF 원문 chunk", log_output)
+        self.assertNotIn("민감한 retrieved context", log_output)
+
+    def test_chunking_config_helpers_use_large_pdf_defaults(self) -> None:
+        rest_config = self.gateway._build_rest_chunking_config(
+            max_tokens_per_chunk=512,
+            max_overlap_tokens=100,
+        )
+        dict_config = self.gateway._build_dict_chunking_config(
+            max_tokens_per_chunk=512,
+            max_overlap_tokens=100,
+        )
+        typed_config = self.gateway._build_typed_chunking_config(
+            max_tokens_per_chunk=512,
+            max_overlap_tokens=100,
+        )
+
+        self.assertEqual(
+            rest_config,
+            {
+                "whiteSpaceConfig": {
+                    "maxTokensPerChunk": 512,
+                    "maxOverlapTokens": 100,
+                }
+            },
+        )
+        self.assertEqual(
+            dict_config,
+            {
+                "white_space_config": {
+                    "max_tokens_per_chunk": 512,
+                    "max_overlap_tokens": 100,
+                }
+            },
+        )
+        self.assertEqual(typed_config.white_space_config.max_tokens_per_chunk, 512)
+        self.assertEqual(typed_config.white_space_config.max_overlap_tokens, 100)
+
+    def test_chunking_config_helpers_clamp_values_above_api_limit(self) -> None:
+        rest_config = self.gateway._build_rest_chunking_config(
+            max_tokens_per_chunk=1000,
+            max_overlap_tokens=100,
+        )
+        typed_config = self.gateway._build_typed_chunking_config(
+            max_tokens_per_chunk=1000,
+            max_overlap_tokens=100,
+        )
+
+        self.assertEqual(rest_config["whiteSpaceConfig"]["maxTokensPerChunk"], 512)
+        self.assertEqual(typed_config.white_space_config.max_tokens_per_chunk, 512)
 
     def test_gateway_requires_file_search_sdk_support(self) -> None:
         with self.assertRaises(GeminiQaError):
