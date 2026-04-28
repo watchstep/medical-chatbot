@@ -4,7 +4,7 @@ import io
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -24,6 +24,7 @@ from app.schemas import (
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 PDF_FILE_RE = re.compile(r"^(result|chart|image)_(\d{8})\.pdf$")
+PATIENT_FOLDER_RE = re.compile(r"^(?P<patient_id>[^_]+)_(?P<name>.+)_(?P<birth>\d{8})$")
 logger = logging.getLogger(__name__)
 
 
@@ -31,6 +32,44 @@ class DriveLookupError(Exception):
     def __init__(self, message: str, *, detail: str | None = None):
         super().__init__(message)
         self.detail = detail
+
+
+@dataclass(frozen=True)
+class PatientFolderInventoryItem:
+    patient_id: str
+    name: str
+    birth: str
+    folder_name: str
+    folder_id: str
+
+
+@dataclass(frozen=True)
+class SkippedPatientFolder:
+    folder_name: str
+    folder_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class PatientIndexReconcileResult:
+    patient_index: PatientIndex
+    added: list[PatientIndexEntry]
+    updated: list[PatientIndexEntry]
+    unchanged: list[PatientIndexEntry]
+    skipped: list[SkippedPatientFolder]
+    missing_in_drive: list[PatientIndexEntry]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "patient_index": self.patient_index.model_dump(exclude_none=True),
+            "added": [item.model_dump(exclude_none=True) for item in self.added],
+            "updated": [item.model_dump(exclude_none=True) for item in self.updated],
+            "unchanged": [item.model_dump(exclude_none=True) for item in self.unchanged],
+            "skipped": [asdict(item) for item in self.skipped],
+            "missing_in_drive": [
+                item.model_dump(exclude_none=True) for item in self.missing_in_drive
+            ],
+        }
 
 
 class DriveGateway:
@@ -264,6 +303,128 @@ class DriveLookupService:
         patient_index: PatientIndex,
     ) -> None:
         self._save_patient_index(patient_index_file_id, patient_index)
+
+    def reconcile_patient_index(self) -> PatientIndexReconcileResult:
+        patient_index, _ = self.load_patient_index_with_file_id()
+        inventory, skipped = self.list_patient_folders()
+
+        inventory_by_patient_id = {
+            item.patient_id: item for item in inventory
+        }
+        added: list[PatientIndexEntry] = []
+        updated: list[PatientIndexEntry] = []
+        unchanged: list[PatientIndexEntry] = []
+        reconciled_patients: list[PatientIndexEntry] = []
+
+        for patient in patient_index.patients:
+            inventory_item = inventory_by_patient_id.pop(patient.patient_id, None)
+            if inventory_item is None:
+                reconciled_patients.append(patient)
+                unchanged.append(patient)
+                continue
+
+            reconciled_patient = patient.model_copy(
+                update={
+                    "name": inventory_item.name,
+                    "birth": inventory_item.birth,
+                    "folder_name": inventory_item.folder_name,
+                    "folder_id": inventory_item.folder_id,
+                }
+            )
+            reconciled_patients.append(reconciled_patient)
+            if reconciled_patient == patient:
+                unchanged.append(reconciled_patient)
+            else:
+                updated.append(reconciled_patient)
+
+        for inventory_item in sorted(
+            inventory_by_patient_id.values(),
+            key=lambda item: (item.patient_id, item.folder_name),
+        ):
+            new_patient = PatientIndexEntry(
+                patient_id=inventory_item.patient_id,
+                name=inventory_item.name,
+                birth=inventory_item.birth,
+                folder_name=inventory_item.folder_name,
+                folder_id=inventory_item.folder_id,
+                kakao_user_ids=[],
+                phone_last4="",
+            )
+            reconciled_patients.append(new_patient)
+            added.append(new_patient)
+
+        missing_in_drive = [
+            patient
+            for patient in patient_index.patients
+            if patient.patient_id not in {item.patient_id for item in inventory}
+        ]
+
+        return PatientIndexReconcileResult(
+            patient_index=PatientIndex(patients=reconciled_patients),
+            added=added,
+            updated=updated,
+            unchanged=unchanged,
+            skipped=skipped,
+            missing_in_drive=missing_in_drive,
+        )
+
+    def list_patient_folders(
+        self,
+    ) -> tuple[list[PatientFolderInventoryItem], list[SkippedPatientFolder]]:
+        root_id = self._find_root_folder_id()
+        patients_folder_id = self._find_child_folder_id(
+            parent_id=root_id,
+            folder_name="patients",
+        )
+        files = self.gateway.list_files(
+            f"'{patients_folder_id}' in parents and "
+            f"mimeType = '{FOLDER_MIME}' and trashed = false"
+        )
+
+        parsed_items: list[PatientFolderInventoryItem] = []
+        skipped: list[SkippedPatientFolder] = []
+        for file in files:
+            folder_id = file["id"]
+            folder_name = file["name"]
+            match = PATIENT_FOLDER_RE.match(folder_name)
+            if match is None:
+                skipped.append(
+                    SkippedPatientFolder(
+                        folder_name=folder_name,
+                        folder_id=folder_id,
+                        reason="invalid_folder_name_format",
+                    )
+                )
+                continue
+            parsed_items.append(
+                PatientFolderInventoryItem(
+                    patient_id=match.group("patient_id"),
+                    name=match.group("name"),
+                    birth=match.group("birth"),
+                    folder_name=folder_name,
+                    folder_id=folder_id,
+                )
+            )
+
+        inventory: list[PatientFolderInventoryItem] = []
+        patient_id_counts: dict[str, int] = {}
+        for item in parsed_items:
+            patient_id_counts[item.patient_id] = patient_id_counts.get(item.patient_id, 0) + 1
+        for item in parsed_items:
+            if patient_id_counts[item.patient_id] > 1:
+                skipped.append(
+                    SkippedPatientFolder(
+                        folder_name=item.folder_name,
+                        folder_id=item.folder_id,
+                        reason="duplicate_patient_id",
+                    )
+                )
+                continue
+            inventory.append(item)
+
+        inventory.sort(key=lambda item: (item.patient_id, item.folder_name))
+        skipped.sort(key=lambda item: (item.folder_name, item.folder_id))
+        return inventory, skipped
 
     def load_patient_index_with_file_id(self) -> tuple[PatientIndex, str]:
         try:

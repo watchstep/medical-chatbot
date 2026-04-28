@@ -26,7 +26,7 @@ class PatientIndexEntry(BaseModel):
     folder_name: str | None = None
     folder_id: str | None = None
     kakao_user_ids: list[str] = Field(default_factory=list)
-    phone_last4: str | None = None
+    phone_last4: str = ""
 
     @model_validator(mode="before")
     @classmethod

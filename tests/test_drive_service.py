@@ -21,6 +21,12 @@ class FakeDriveGateway:
             "'root' in parents and name = 'patients' and mimeType = 'application/vnd.google-apps.folder' and trashed = false": [
                 {"id": "patients-folder", "name": "patients", "mimeType": "application/vnd.google-apps.folder"}
             ],
+            "'patients-folder' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false": [
+                {"id": "patient-folder", "name": "P0001_손창선_19461230", "mimeType": "application/vnd.google-apps.folder"},
+                {"id": "patient-folder-2", "name": "P0002_홍길동_19800515", "mimeType": "application/vnd.google-apps.folder"},
+                {"id": "patient-folder-3", "name": "P0003_김영희_19770101", "mimeType": "application/vnd.google-apps.folder"},
+                {"id": "bad-folder", "name": "잘못된폴더명", "mimeType": "application/vnd.google-apps.folder"},
+            ],
             "'patients-folder' in parents and name = 'P0001_손창선_19461230' and mimeType = 'application/vnd.google-apps.folder' and trashed = false": [
                 {"id": "patient-folder", "name": "P0001_손창선_19461230", "mimeType": "application/vnd.google-apps.folder"}
             ],
@@ -131,6 +137,12 @@ class FakeDriveGateway:
                 "mimeType": "application/vnd.google-apps.folder",
                 "parents": ["patients-folder"]
             },
+            "patient-folder-3": {
+                "id": "patient-folder-3",
+                "name": "P0003_\352\271\200\354\230\201\355\235\254_19770101",
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": ["patients-folder"]
+            },
         }
         self.updated_files: dict[str, bytes] = {}
 
@@ -206,6 +218,7 @@ class DriveLookupServiceTest(unittest.TestCase):
         )
         self.assertEqual(first_patient.folder_name, "P0001_손창선_19461230")
         self.assertIn("kakao-user-id-1", first_patient.kakao_user_ids)
+        self.assertEqual(first_patient.phone_last4, "")
 
     def test_get_patient_record_context_selects_latest_files_by_filename_date(self) -> None:
         patient = self.service.load_patient_index().patients[0]
@@ -260,6 +273,71 @@ class DriveLookupServiceTest(unittest.TestCase):
 
         self.assertIsNotNone(patient)
         self.assertEqual(patient.patient_id, "P0001")
+
+    def test_reconcile_patient_index_adds_missing_drive_patient_and_skips_invalid_folder(self) -> None:
+        result = self.service.reconcile_patient_index()
+
+        self.assertEqual(
+            [patient.patient_id for patient in result.added],
+            ["P0003"],
+        )
+        added_patient = result.added[0]
+        self.assertEqual(added_patient.folder_id, "patient-folder-3")
+        self.assertEqual(added_patient.kakao_user_ids, [])
+        self.assertEqual(added_patient.phone_last4, "")
+        self.assertEqual(
+            [item.folder_name for item in result.skipped],
+            ["잘못된폴더명"],
+        )
+        reconciled_patient = next(
+            item for item in result.patient_index.patients if item.patient_id == "P0001"
+        )
+        self.assertIn("kakao-user-id-1", reconciled_patient.kakao_user_ids)
+
+    def test_reconcile_patient_index_reports_existing_index_missing_in_drive_without_deleting(self) -> None:
+        self.service.gateway.file_map["patient-index"] = b"""
+        {
+          "patients": [
+            {
+              "patient_id": "P9999",
+              "name": "\353\210\204\353\235\275\355\231\230",
+              "birth": "19990101",
+              "folder_name": "P9999_\353\210\204\353\235\275\355\231\230_19990101",
+              "kakao_user_ids": ["legacy-user"]
+            }
+          ]
+        }
+        """
+
+        result = self.service.reconcile_patient_index()
+
+        self.assertEqual(
+            [patient.patient_id for patient in result.missing_in_drive],
+            ["P9999"],
+        )
+        self.assertEqual(
+            [patient.patient_id for patient in result.patient_index.patients],
+            ["P9999", "P0001", "P0002", "P0003"],
+        )
+
+    def test_reconcile_patient_index_skips_duplicate_patient_ids(self) -> None:
+        self.service.gateway.list_map[
+            "'patients-folder' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        ].append(
+            {
+                "id": "patient-folder-duplicate",
+                "name": "P0003_김영희_19770101",
+                "mimeType": "application/vnd.google-apps.folder",
+            }
+        )
+
+        result = self.service.reconcile_patient_index()
+
+        self.assertEqual(result.added, [])
+        self.assertEqual(
+            sorted(item.reason for item in result.skipped if item.folder_name == "P0003_김영희_19770101"),
+            ["duplicate_patient_id", "duplicate_patient_id"],
+        )
 
     def test_authenticate_and_map_patient_saves_kakao_user_id(self) -> None:
         patient = self.service.authenticate_and_map_patient(

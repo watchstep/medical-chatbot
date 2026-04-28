@@ -28,6 +28,22 @@ https://{ngrok-domain}/kakao/chat
 - 테스트 대상 환자는 `patient_index.json`에 `name`, `birth`, `folder_name`이 정확히 있어야 합니다.
 - 최초 매핑 검증 전에는 테스트 대상 카카오 계정의 `kakao_user_id`가 해당 환자 `kakao_user_ids`에 없어야 합니다.
 
+## Patient Index Reconcile
+
+Google Drive `patients/` 아래에 환자 폴더는 있지만 `_system/patient_index.json`에 누락된 경우 아래 명령으로 보정할 수 있습니다.
+
+자동 보정으로 새로 추가되는 환자 엔트리에는 `phone_last4`가 기본적으로 빈 문자열 `""`로 들어갑니다.
+
+```bash
+python -m app.tools.reconcile_patient_index
+```
+
+기본은 `dry-run`이며 변경 요약만 출력합니다. 실제로 Google Drive의 `patient_index.json`을 갱신하려면 아래처럼 실행합니다.
+
+```bash
+python -m app.tools.reconcile_patient_index --apply
+```
+
 ## Kakao Verification Flow
 
 1. 카카오톡 시작 블록 또는 인증하기 블록을 `/kakao/auth`에 연결합니다.
