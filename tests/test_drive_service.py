@@ -18,6 +18,9 @@ class FakeDriveGateway:
             "'system' in parents and name = 'patient_index.json' and trashed = false": [
                 {"id": "patient-index", "name": "patient_index.json", "mimeType": "application/json"}
             ],
+            "'system' in parents and name = 'document_registry.json' and trashed = false": [
+                {"id": "document-registry", "name": "document_registry.json", "mimeType": "application/json"}
+            ],
             "'root' in parents and name = 'patients' and mimeType = 'application/vnd.google-apps.folder' and trashed = false": [
                 {"id": "patients-folder", "name": "patients", "mimeType": "application/vnd.google-apps.folder"}
             ],
@@ -41,16 +44,16 @@ class FakeDriveGateway:
             ],
             "'patient-folder' in parents and trashed = false": [
                 {"id": "meta-file", "name": "meta.json", "mimeType": "application/json"},
-                {"id": "result-old", "name": "result_20260420.pdf", "mimeType": "application/pdf"},
-                {"id": "result-new", "name": "result_20260421.pdf", "mimeType": "application/pdf"},
-                {"id": "chart-old", "name": "chart_20260419.pdf", "mimeType": "application/pdf"},
-                {"id": "chart-new", "name": "chart_20260421.pdf", "mimeType": "application/pdf"},
-                {"id": "image-file", "name": "image_20260421.pdf", "mimeType": "application/pdf"},
-                {"id": "ignored-file", "name": "result_latest.pdf", "mimeType": "application/pdf"},
+                {"id": "result-old", "name": "result_20260420.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-04-20T10:00:00Z"},
+                {"id": "result-new", "name": "result_20260421.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-04-21T10:00:00Z"},
+                {"id": "chart-old", "name": "chart_20260419.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-04-19T10:00:00Z"},
+                {"id": "chart-new", "name": "chart_20260421.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-04-21T11:00:00Z"},
+                {"id": "image-file", "name": "image_20260421.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-04-21T12:00:00Z"},
+                {"id": "ignored-file", "name": "result_latest.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-04-21T13:00:00Z"},
             ],
             "'patient-folder-2' in parents and trashed = false": [
                 {"id": "meta-file-2", "name": "meta.json", "mimeType": "application/json"},
-                {"id": "result-2", "name": "result_20260410.pdf", "mimeType": "application/pdf"},
+                {"id": "result-2", "name": "result_20260410.pdf", "mimeType": "application/pdf", "modifiedTime": "2026-04-10T09:00:00Z"},
             ],
         }
         self.file_map = {
@@ -70,6 +73,39 @@ class FakeDriveGateway:
                   "birth": "19800515",
                   "folder_name": "P0002_\355\231\215\352\270\270\353\217\231_19800515",
                   "kakao_user_ids": ["mapped-user-2"]
+                }
+              ]
+            }
+            """,
+            "document-registry": b"""
+            {
+              "generated_at": "2026-04-28T12:10:00+09:00",
+              "documents": [
+                {
+                  "patient_id": "P0001",
+                  "filename": "result_20260421.pdf",
+                  "document_type": "result",
+                  "document_date": "20260421",
+                  "drive_file_id": "result-new",
+                  "drive_modified_time": "2026-04-21T10:00:00Z",
+                  "file_hash": "result-hash",
+                  "file_search_store_name": "fileSearchStores/patient-P0001",
+                  "file_search_document_name": "fileSearchStores/patient-P0001/documents/result-new",
+                  "sync_status": "READY",
+                  "synced_at": "2026-04-28T12:10:00+09:00"
+                },
+                {
+                  "patient_id": "P0001",
+                  "filename": "chart_20260421.pdf",
+                  "document_type": "chart",
+                  "document_date": "20260421",
+                  "drive_file_id": "chart-new",
+                  "drive_modified_time": "2026-04-21T11:00:00Z",
+                  "file_hash": "chart-hash",
+                  "file_search_store_name": "fileSearchStores/patient-P0001",
+                  "file_search_document_name": "fileSearchStores/patient-P0001/documents/chart-new",
+                  "sync_status": "READY",
+                  "synced_at": "2026-04-28T12:10:00+09:00"
                 }
               ]
             }
@@ -128,8 +164,11 @@ class FakeDriveGateway:
                 "mimeType": "application/vnd.google-apps.folder",
                 "parents": ["patients-folder"]
             },
+            "result-old": b"result old pdf bytes",
             "result-new": b"result pdf bytes",
+            "chart-old": b"chart old pdf bytes",
             "chart-new": b"chart pdf bytes",
+            "image-file": b"image pdf bytes",
             "result-2": b"result 2 pdf bytes",
             "patient-folder-2": {
                 "id": "patient-folder-2",
@@ -158,6 +197,15 @@ class FakeDriveGateway:
     def update_file_bytes(self, file_id: str, content: bytes, mime_type: str) -> None:
         self.updated_files[file_id] = content
         self.file_map[file_id] = content
+
+    def create_file_bytes(self, parent_id: str, file_name: str, content: bytes, mime_type: str) -> str:
+        created_id = f"created-{file_name}"
+        self.updated_files[created_id] = content
+        self.file_map[created_id] = content
+        self.list_map[f"'{parent_id}' in parents and name = '{file_name}' and trashed = false"] = [
+            {"id": created_id, "name": file_name, "mimeType": mime_type}
+        ]
+        return created_id
 
 
 class LegacyFakeDriveGateway(FakeDriveGateway):
@@ -274,8 +322,8 @@ class DriveLookupServiceTest(unittest.TestCase):
         self.assertIsNotNone(patient)
         self.assertEqual(patient.patient_id, "P0001")
 
-    def test_reconcile_patient_index_adds_missing_drive_patient_and_skips_invalid_folder(self) -> None:
-        result = self.service.reconcile_patient_index()
+    def test_sync_patient_index_adds_missing_drive_patient_and_skips_invalid_folder(self) -> None:
+        result = self.service.sync_patient_index()
 
         self.assertEqual(
             [patient.patient_id for patient in result.added],
@@ -294,7 +342,7 @@ class DriveLookupServiceTest(unittest.TestCase):
         )
         self.assertIn("kakao-user-id-1", reconciled_patient.kakao_user_ids)
 
-    def test_reconcile_patient_index_reports_existing_index_missing_in_drive_without_deleting(self) -> None:
+    def test_sync_patient_index_reports_existing_index_missing_in_drive_without_deleting(self) -> None:
         self.service.gateway.file_map["patient-index"] = b"""
         {
           "patients": [
@@ -309,7 +357,7 @@ class DriveLookupServiceTest(unittest.TestCase):
         }
         """
 
-        result = self.service.reconcile_patient_index()
+        result = self.service.sync_patient_index()
 
         self.assertEqual(
             [patient.patient_id for patient in result.missing_in_drive],
@@ -320,7 +368,7 @@ class DriveLookupServiceTest(unittest.TestCase):
             ["P9999", "P0001", "P0002", "P0003"],
         )
 
-    def test_reconcile_patient_index_skips_duplicate_patient_ids(self) -> None:
+    def test_sync_patient_index_skips_duplicate_patient_ids(self) -> None:
         self.service.gateway.list_map[
             "'patients-folder' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         ].append(
@@ -331,7 +379,7 @@ class DriveLookupServiceTest(unittest.TestCase):
             }
         )
 
-        result = self.service.reconcile_patient_index()
+        result = self.service.sync_patient_index()
 
         self.assertEqual(result.added, [])
         self.assertEqual(

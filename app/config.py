@@ -11,12 +11,14 @@ class Settings(BaseSettings):
     drive_root_folder_name: str = "medical-chatbot"
     drive_system_folder_name: str = "_system"
     patient_index_file_name: str = "patient_index.json"
+    document_registry_file_name: str = "document_registry.json"
     meta_file_name: str = "meta.json"
     session_ttl_minutes: int = 1440
     patient_index_cache_ttl_seconds: int = 300
+    document_registry_cache_ttl_seconds: int = 300
     patient_record_cache_ttl_seconds: int = 600
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.5-flash"
     gemini_context_cache_ttl_hours: int = 24
 
     model_config = SettingsConfigDict(

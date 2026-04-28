@@ -34,3 +34,6 @@ class InMemorySessionStore:
             patient=patient,
             expires_at=datetime.now(KST) + self.ttl,
         )
+
+    def delete(self, kakao_user_id: str) -> None:
+        self._store.pop(kakao_user_id, None)

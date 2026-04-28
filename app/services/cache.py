@@ -5,8 +5,16 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from app.config import Settings
-from app.schemas import PatientIndex, PatientIndexEntry, PatientRecordContext
+from app.schemas import (
+    DocumentRegistry,
+    DocumentRegistryEntry,
+    PatientDocumentRegistryContext,
+    PatientIndex,
+    PatientIndexEntry,
+    PatientRecordContext,
+)
 from app.services.drive import DriveLookupError, DriveLookupService
+from app.services.gemini_qa import is_file_search_store_name
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +35,13 @@ class CachedPatientRecordState:
 
 
 @dataclass
+class CachedDocumentRegistryState:
+    document_registry: DocumentRegistry
+    document_registry_file_id: str | None
+    expires_at: datetime
+
+
+@dataclass
 class AuthResult:
     patient: PatientIndexEntry
     persistence_required: bool
@@ -42,6 +57,7 @@ class PatientDataCacheService:
         self.settings = settings
         self.drive_service = drive_service
         self._patient_index_state: CachedPatientIndexState | None = None
+        self._document_registry_state: CachedDocumentRegistryState | None = None
         self._patient_record_states: dict[str, CachedPatientRecordState] = {}
 
     def get_patient_by_kakao_user_id(self, kakao_user_id: str) -> PatientIndexEntry | None:
@@ -92,6 +108,58 @@ class PatientDataCacheService:
             patient_index_file_id=state.patient_index_file_id,
             patient_index=state.patient_index,
         )
+
+    def get_patient_document_context(
+        self,
+        *,
+        patient: PatientIndexEntry,
+    ) -> PatientDocumentRegistryContext:
+        document_registry = self._get_document_registry_state().document_registry
+        patient_documents = [
+            item
+            for item in document_registry.documents
+            if item.patient_id == patient.patient_id
+        ]
+        ready_documents = [
+            item for item in patient_documents if item.sync_status == "READY"
+        ]
+        latest_result = self._latest_document_by_type(ready_documents, "result")
+        latest_chart = self._latest_document_by_type(ready_documents, "chart")
+        store_names = {
+            item.file_search_store_name
+            for item in ready_documents
+            if is_file_search_store_name(item.file_search_store_name)
+        }
+        return PatientDocumentRegistryContext(
+            patient=patient,
+            documents=patient_documents,
+            latest_result=latest_result,
+            latest_chart=latest_chart,
+            file_search_store_name=next(iter(store_names), None),
+        )
+
+    def reset_kakao_user_id(self, *, kakao_user_id: str) -> bool:
+        state = self._get_patient_index_state()
+        updated_patients: list[PatientIndexEntry] = []
+        changed = False
+        for patient in state.patient_index.patients:
+            filtered_user_ids = [
+                user_id for user_id in patient.kakao_user_ids if user_id != kakao_user_id
+            ]
+            if len(filtered_user_ids) != len(patient.kakao_user_ids):
+                changed = True
+                updated_patients.append(
+                    patient.model_copy(update={"kakao_user_ids": filtered_user_ids})
+                )
+            else:
+                updated_patients.append(patient)
+        if changed:
+            self._patient_index_state = CachedPatientIndexState(
+                patient_index=PatientIndex(patients=updated_patients),
+                patient_index_file_id=state.patient_index_file_id,
+                expires_at=self._build_patient_index_expiry(),
+            )
+        return changed
 
     def get_cached_patient_record_context(
         self,
@@ -156,8 +224,42 @@ class PatientDataCacheService:
     def _build_patient_index_expiry(self) -> datetime:
         return datetime.now(KST) + timedelta(seconds=self.settings.patient_index_cache_ttl_seconds)
 
+    def _build_document_registry_expiry(self) -> datetime:
+        return datetime.now(KST) + timedelta(
+            seconds=self.settings.document_registry_cache_ttl_seconds
+        )
+
     def _build_patient_record_expiry(self) -> datetime:
         return datetime.now(KST) + timedelta(seconds=self.settings.patient_record_cache_ttl_seconds)
+
+    def _get_document_registry_state(self) -> CachedDocumentRegistryState:
+        now = datetime.now(KST)
+        if self._document_registry_state is not None and self._document_registry_state.expires_at > now:
+            logger.info("document_registry_cache hit")
+            return self._document_registry_state
+
+        logger.info("document_registry_cache miss")
+        document_registry, document_registry_file_id = (
+            self.drive_service.load_document_registry_with_file_id()
+        )
+        self._document_registry_state = CachedDocumentRegistryState(
+            document_registry=document_registry,
+            document_registry_file_id=document_registry_file_id,
+            expires_at=self._build_document_registry_expiry(),
+        )
+        return self._document_registry_state
+
+    def _latest_document_by_type(
+        self,
+        documents: list[DocumentRegistryEntry],
+        document_type: str,
+    ) -> DocumentRegistryEntry | None:
+        matches = [
+            item for item in documents if item.document_type == document_type
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda item: (item.document_date, item.filename))
 
     def _find_patient_by_kakao_user_id(
         self,

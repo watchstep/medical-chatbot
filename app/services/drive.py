@@ -13,6 +13,8 @@ from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
 
 from app.config import Settings
 from app.schemas import (
+    DocumentRegistry,
+    DocumentRegistryEntry,
     DriveFile,
     PatientFileMeta,
     PatientIndex,
@@ -51,7 +53,7 @@ class SkippedPatientFolder:
 
 
 @dataclass(frozen=True)
-class PatientIndexReconcileResult:
+class PatientIndexSyncResult:
     patient_index: PatientIndex
     added: list[PatientIndexEntry]
     updated: list[PatientIndexEntry]
@@ -85,6 +87,15 @@ class DriveGateway:
     def update_file_bytes(self, file_id: str, content: bytes, mime_type: str) -> None:
         raise NotImplementedError
 
+    def create_file_bytes(
+        self,
+        parent_id: str,
+        file_name: str,
+        content: bytes,
+        mime_type: str,
+    ) -> str:
+        raise NotImplementedError
+
 
 class GoogleDriveGateway(DriveGateway):
     def __init__(self, credentials_path: str):
@@ -101,7 +112,7 @@ class GoogleDriveGateway(DriveGateway):
                 self.service.files()
                 .list(
                     q=query,
-                    fields="files(id,name,mimeType)",
+                    fields="files(id,name,mimeType,modifiedTime,parents)",
                     supportsAllDrives=True,
                     includeItemsFromAllDrives=True,
                 )
@@ -167,6 +178,36 @@ class GoogleDriveGateway(DriveGateway):
                 "Google Drive 파일 저장에 실패했습니다.",
                 detail=str(exc),
             ) from exc
+
+    def create_file_bytes(
+        self,
+        parent_id: str,
+        file_name: str,
+        content: bytes,
+        mime_type: str,
+    ) -> str:
+        try:
+            media = MediaInMemoryUpload(content, mimetype=mime_type, resumable=False)
+            created = (
+                self.service.files()
+                .create(
+                    body={
+                        "name": file_name,
+                        "parents": [parent_id],
+                    },
+                    media_body=media,
+                    fields="id",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+        except HttpError as exc:
+            logger.exception("Google Drive create_file_bytes failed")
+            raise DriveLookupError(
+                "Google Drive 파일 생성에 실패했습니다.",
+                detail=str(exc),
+            ) from exc
+        return created["id"]
 
 
 @dataclass
@@ -296,6 +337,10 @@ class DriveLookupService:
         patient_index, _ = self.load_patient_index_with_file_id()
         return patient_index
 
+    def load_document_registry(self) -> DocumentRegistry:
+        document_registry, _ = self.load_document_registry_with_file_id()
+        return document_registry
+
     def persist_patient_index(
         self,
         *,
@@ -304,7 +349,15 @@ class DriveLookupService:
     ) -> None:
         self._save_patient_index(patient_index_file_id, patient_index)
 
-    def reconcile_patient_index(self) -> PatientIndexReconcileResult:
+    def persist_document_registry(
+        self,
+        *,
+        document_registry_file_id: str | None,
+        document_registry: DocumentRegistry,
+    ) -> str:
+        return self._save_document_registry(document_registry_file_id, document_registry)
+
+    def sync_patient_index(self) -> PatientIndexSyncResult:
         patient_index, _ = self.load_patient_index_with_file_id()
         inventory, skipped = self.list_patient_folders()
 
@@ -359,7 +412,7 @@ class DriveLookupService:
             if patient.patient_id not in {item.patient_id for item in inventory}
         ]
 
-        return PatientIndexReconcileResult(
+        return PatientIndexSyncResult(
             patient_index=PatientIndex(patients=reconciled_patients),
             added=added,
             updated=updated,
@@ -448,6 +501,33 @@ class DriveLookupService:
                 detail=str(exc),
             ) from exc
 
+    def load_document_registry_with_file_id(self) -> tuple[DocumentRegistry, str | None]:
+        try:
+            root_id = self._find_root_folder_id()
+            system_folder_id = self._find_child_folder_id(
+                parent_id=root_id,
+                folder_name=self.settings.drive_system_folder_name,
+            )
+            document_registry_file_id = self._find_optional_file_id(
+                parent_id=system_folder_id,
+                file_name=self.settings.document_registry_file_name,
+            )
+            if document_registry_file_id is None:
+                return DocumentRegistry(documents=[]), None
+            content = self.gateway.download_file_bytes(document_registry_file_id)
+            return (
+                DocumentRegistry.model_validate(json.loads(content.decode("utf-8"))),
+                document_registry_file_id,
+            )
+        except DriveLookupError:
+            raise
+        except Exception as exc:
+            logger.exception("Failed to load document registry")
+            raise DriveLookupError(
+                "document_registry.json 조회에 실패했습니다.",
+                detail=str(exc),
+            ) from exc
+
     def get_patient_record_context(
         self,
         patient: PatientIndexEntry,
@@ -491,6 +571,21 @@ class DriveLookupService:
                 detail=str(exc),
             ) from exc
 
+    def list_patient_document_files(self, patient: PatientIndexEntry) -> list[dict]:
+        try:
+            patient_folder_id = self._get_patient_folder_id(patient)
+            return self.gateway.list_files(
+                f"'{patient_folder_id}' in parents and trashed = false"
+            )
+        except DriveLookupError:
+            raise
+        except Exception as exc:
+            logger.exception("Failed to list patient document files")
+            raise DriveLookupError(
+                "환자 문서 목록 조회에 실패했습니다.",
+                detail=str(exc),
+            ) from exc
+
     def _load_or_build_meta(
         self,
         patient: PatientIndexEntry,
@@ -528,6 +623,45 @@ class DriveLookupService:
             logger.exception("Failed to save patient index")
             raise DriveLookupError(
                 "patient_index.json 저장에 실패했습니다.",
+                detail=str(exc),
+            ) from exc
+
+    def _save_document_registry(
+        self,
+        document_registry_file_id: str | None,
+        document_registry: DocumentRegistry,
+    ) -> str:
+        try:
+            content = json.dumps(
+                document_registry.model_dump(exclude_none=True),
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+            if document_registry_file_id is not None:
+                self.gateway.update_file_bytes(
+                    document_registry_file_id,
+                    content,
+                    "application/json",
+                )
+                return document_registry_file_id
+
+            root_id = self._find_root_folder_id()
+            system_folder_id = self._find_child_folder_id(
+                parent_id=root_id,
+                folder_name=self.settings.drive_system_folder_name,
+            )
+            return self.gateway.create_file_bytes(
+                system_folder_id,
+                self.settings.document_registry_file_name,
+                content,
+                "application/json",
+            )
+        except DriveLookupError:
+            raise
+        except Exception as exc:
+            logger.exception("Failed to save document registry")
+            raise DriveLookupError(
+                "document_registry.json 저장에 실패했습니다.",
                 detail=str(exc),
             ) from exc
 

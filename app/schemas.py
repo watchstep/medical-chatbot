@@ -112,3 +112,35 @@ class PatientRecordContext(BaseModel):
     meta: PatientMeta
     latest_result: DriveFile | None
     latest_chart: DriveFile | None
+
+
+class DocumentRegistryEntry(BaseModel):
+    patient_id: str
+    filename: str
+    document_type: str = ""
+    document_date: str = ""
+    drive_file_id: str = ""
+    drive_modified_time: str = ""
+    file_hash: str = ""
+    file_search_store_name: str = ""
+    file_search_document_name: str = ""
+    sync_status: str
+    synced_at: str = ""
+
+    @model_validator(mode="after")
+    def normalize_dates(self) -> "DocumentRegistryEntry":
+        self.document_date = self.document_date.replace("-", "")
+        return self
+
+
+class DocumentRegistry(BaseModel):
+    generated_at: str | None = None
+    documents: list[DocumentRegistryEntry] = Field(default_factory=list)
+
+
+class PatientDocumentRegistryContext(BaseModel):
+    patient: PatientIndexEntry
+    documents: list[DocumentRegistryEntry]
+    latest_result: DocumentRegistryEntry | None
+    latest_chart: DocumentRegistryEntry | None
+    file_search_store_name: str | None = None

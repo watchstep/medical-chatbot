@@ -5,7 +5,7 @@ import re
 
 from fastapi import BackgroundTasks
 
-from app.schemas import KakaoSkillRequest, PatientIndexEntry, PatientRecordContext
+from app.schemas import KakaoSkillRequest, PatientDocumentRegistryContext, PatientIndexEntry
 from app.services.cache import PatientDataCacheService
 from app.services.drive import DriveLookupError
 from app.services.gemini_qa import GeminiQaError, GeminiQaService, GeminiRecordNotFoundError
@@ -19,6 +19,12 @@ from app.sessions import InMemorySessionStore
 
 logger = logging.getLogger(__name__)
 AUTH_PREFIX = "인증 "
+AUTH_RESET_COMMANDS = {
+    "인증 초기화",
+    "다른 환자 인증",
+    "환자 변경",
+    "재인증",
+}
 BIRTH_RE = re.compile(r"^\d{8}$")
 LATEST_RECORD_INTENTS = {
     "최신기록",
@@ -85,6 +91,13 @@ RECORD_PREPARING_MESSAGE = (
     "최신 진단 기록을 조회 중입니다.\n"
     "잠시 후 다시 [💾 최신 기록 조회]을 눌러 주세요."
 )
+AUTH_RESET_MESSAGE = (
+    "기존 인증 정보를 초기화했습니다.\n"
+    "아래 형식으로 다시 입력해 주세요.\n"
+    "인증 이름 생년월일 (YYYYMMDD)↩️\n\n"
+    "예시:\n"
+    "인증 홍길동 19890515"
+)
 def simple_text_response(text: str) -> dict:
     return build_simple_text_response(text)
 
@@ -117,6 +130,9 @@ class ChatbotService:
             return simple_text_response(
                 "현재 진료기록 시스템에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요."
             )
+
+        if utterance in AUTH_RESET_COMMANDS:
+            return self._handle_auth_reset(user_id, background_tasks)
 
         if utterance.startswith(AUTH_PREFIX):
             return self._handle_auth(user_id, utterance, background_tasks)
@@ -156,6 +172,9 @@ class ChatbotService:
                 "현재 진료기록 시스템에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요."
             )
 
+        if utterance in AUTH_RESET_COMMANDS:
+            return self._handle_auth_reset(user_id, background_tasks)
+
         if utterance.startswith(AUTH_PREFIX):
             return self._handle_auth(user_id, utterance, background_tasks)
 
@@ -177,37 +196,35 @@ class ChatbotService:
 
         return self._handle_latest_record(
             patient=patient,
-            background_tasks=background_tasks,
         )
 
     def _handle_latest_record(
         self,
         *,
         patient: PatientIndexEntry,
-        background_tasks: BackgroundTasks,
     ) -> dict:
         try:
-            context = self.patient_data_cache_service.get_cached_patient_record_context(
-                patient_id=patient.patient_id,
-                allow_stale=True,
+            context = self.patient_data_cache_service.get_patient_document_context(
+                patient=patient,
             )
         except DriveLookupError:
             return simple_text_response(
                 "현재 진료기록을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
             )
-        if context is None:
-            background_tasks.add_task(
-                self._warm_patient_record_context,
-                patient,
-            )
-            return simple_text_response(RECORD_PREPARING_MESSAGE)
+        if not self._has_ready_documents(context):
+            if self._has_sync_in_progress_documents(context):
+                return simple_text_response(RECORD_PREPARING_MESSAGE)
+            return simple_text_response(NO_RECORD_MESSAGE)
+
+        latest_summary_title = self._build_latest_summary_title(context)
+        latest_summary_description = self._build_latest_summary_description(context)
 
         return simple_text_response(
-            f"{context.patient.name}님 안녕하세요.\n"
-            f"{context.meta.latest_summary.title}\n"
-            f"{context.meta.latest_summary.description}\n\n"
-            f"👉최신 검사결과지: {context.latest_result.name if context.latest_result else '없음'}\n"
-            f"👉최신 진료기록부: {context.latest_chart.name if context.latest_chart else '없음'}"
+            f"{patient.name}님 안녕하세요.\n"
+            f"{latest_summary_title}\n"
+            f"{latest_summary_description}\n\n"
+            f"👉최신 검사결과지: {context.latest_result.filename if context.latest_result else '없음'}\n"
+            f"👉최신 진료기록부: {context.latest_chart.filename if context.latest_chart else '없음'}"
         )
 
     def _handle_free_question(
@@ -237,19 +254,23 @@ class ChatbotService:
     ) -> None:
         logger.info("free_question_callback start patient_id=%s", patient.patient_id)
         try:
-            context = self.patient_data_cache_service.get_or_fetch_patient_record_context(
+            context = self.patient_data_cache_service.get_patient_document_context(
                 patient=patient,
-                allow_stale=True,
             )
-            answer = self._generate_free_question_answer(
-                question=question,
-                context=context,
-            )
-        except DriveLookupError as exc:
-            if str(exc) == "환자 폴더에 조회 가능한 PDF가 없습니다.":
-                answer = NO_RECORD_MESSAGE
+            if not self._has_ready_documents(context):
+                answer = (
+                    RECORD_PREPARING_MESSAGE
+                    if self._has_sync_in_progress_documents(context)
+                    else NO_RECORD_MESSAGE
+                )
             else:
-                answer = FREE_QUESTION_FAILURE_MESSAGE
+                answer = self._generate_free_question_answer(
+                    question=question,
+                    context=context,
+                )
+        except DriveLookupError as exc:
+            logger.warning("free_question_callback document lookup failure: %s", str(exc))
+            answer = FREE_QUESTION_FAILURE_MESSAGE
         except Exception:
             logger.exception("free_question_callback unexpected failure")
             answer = FREE_QUESTION_FAILURE_MESSAGE
@@ -267,7 +288,7 @@ class ChatbotService:
         self,
         *,
         question: str,
-        context: PatientRecordContext,
+        context: PatientDocumentRegistryContext,
     ) -> str:
         if self.gemini_qa_service is None:
             return FREE_QUESTION_FAILURE_MESSAGE
@@ -275,7 +296,6 @@ class ChatbotService:
             return self.gemini_qa_service.answer_question(
                 question=question,
                 context=context,
-                drive_service=self.patient_data_cache_service.drive_service,
             )
         except GeminiRecordNotFoundError:
             return NO_RECORD_MESSAGE
@@ -313,8 +333,18 @@ class ChatbotService:
         self.session_store.set(user_id, patient)
         if auth_result.persistence_required:
             background_tasks.add_task(self._persist_patient_index)
-        background_tasks.add_task(self._warm_patient_record_context, patient)
         return simple_text_response(AUTH_SUCCESS_MESSAGE.format(patient_name=patient.name))
+
+    def _handle_auth_reset(
+        self,
+        user_id: str,
+        background_tasks: BackgroundTasks,
+    ) -> dict:
+        changed = self.patient_data_cache_service.reset_kakao_user_id(kakao_user_id=user_id)
+        self.session_store.delete(user_id)
+        if changed:
+            background_tasks.add_task(self._persist_patient_index)
+        return simple_text_response(AUTH_RESET_MESSAGE)
 
     def _resolve_user_state(
         self,
@@ -336,16 +366,48 @@ class ChatbotService:
         except Exception:
             logger.exception("patient_index persist failure")
 
-    def _warm_patient_record_context(self, patient: PatientIndexEntry) -> None:
-        try:
-            self.patient_data_cache_service.warm_patient_record_context(patient)
-            logger.info("patient_record warm success patient_id=%s", patient.patient_id)
-        except Exception:
-            logger.exception("patient_record warm failure patient_id=%s", patient.patient_id)
-
     def _is_latest_record_intent(self, utterance: str) -> bool:
         normalized = utterance.replace(" ", "").replace("💾", "")
         return utterance in LATEST_RECORD_INTENTS or normalized in {
             "최신기록",
             "최신기록보여줘",
         }
+
+    def _has_ready_documents(self, context: PatientDocumentRegistryContext) -> bool:
+        return any(item.sync_status == "READY" for item in context.documents)
+
+    def _has_sync_in_progress_documents(self, context: PatientDocumentRegistryContext) -> bool:
+        return any(
+            item.sync_status in {"PENDING", "INDEXING", "STALE"}
+            for item in context.documents
+        )
+
+    def _build_latest_summary_title(self, context: PatientDocumentRegistryContext) -> str:
+        latest_date = max(
+            (
+                item.document_date
+                for item in (context.latest_result, context.latest_chart)
+                if item is not None and item.document_date
+            ),
+            default="",
+        )
+        if not latest_date:
+            return "최신 진단 기록"
+        return (
+            f"{latest_date[:4]}년 {int(latest_date[4:6])}월 "
+            f"{int(latest_date[6:8])}일 진료 및 검사 기록"
+        )
+
+    def _build_latest_summary_description(
+        self,
+        context: PatientDocumentRegistryContext,
+    ) -> str:
+        has_result = context.latest_result is not None
+        has_chart = context.latest_chart is not None
+        if has_result and has_chart:
+            return "최근 검사결과지와 진료기록부가 등록되어 있습니다."
+        if has_result:
+            return "최근 검사결과지가 등록되어 있습니다."
+        if has_chart:
+            return "최근 진료기록부가 등록되어 있습니다."
+        return "최근 진료 기록이 등록되어 있습니다."

@@ -8,11 +8,11 @@ from unittest.mock import patch
 
 from app.config import Settings
 from app.services.drive import DriveLookupService
-from app.tools import reconcile_patient_index
+from app.tools import sync_patient_index
 from tests.test_drive_service import FakeDriveGateway
 
 
-class ReconcilePatientIndexCliTest(unittest.TestCase):
+class SyncPatientIndexCliTest(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = Settings(
             google_service_account_path="credentials/google-service-account.json",
@@ -26,15 +26,15 @@ class ReconcilePatientIndexCliTest(unittest.TestCase):
     def test_cli_dry_run_does_not_persist(self) -> None:
         stdout = io.StringIO()
         with patch.object(
-            reconcile_patient_index,
+            sync_patient_index,
             "get_settings",
             return_value=self.settings,
         ), patch.object(
-            reconcile_patient_index,
+            sync_patient_index,
             "build_default_drive_service",
             return_value=self.drive_service,
         ), redirect_stdout(stdout):
-            exit_code = reconcile_patient_index.main(["--json"])
+            exit_code = sync_patient_index.main(["--json"])
 
         self.assertEqual(exit_code, 0)
         payload = json.loads(stdout.getvalue())
@@ -43,18 +43,18 @@ class ReconcilePatientIndexCliTest(unittest.TestCase):
         self.assertEqual(len(payload["added"]), 1)
         self.assertNotIn("patient-index", self.gateway.updated_files)
 
-    def test_cli_apply_persists_reconciled_index(self) -> None:
+    def test_cli_apply_persists_synced_index(self) -> None:
         stdout = io.StringIO()
         with patch.object(
-            reconcile_patient_index,
+            sync_patient_index,
             "get_settings",
             return_value=self.settings,
         ), patch.object(
-            reconcile_patient_index,
+            sync_patient_index,
             "build_default_drive_service",
             return_value=self.drive_service,
         ), redirect_stdout(stdout):
-            exit_code = reconcile_patient_index.main(["--apply", "--json"])
+            exit_code = sync_patient_index.main(["--apply", "--json"])
 
         self.assertEqual(exit_code, 0)
         payload = json.loads(stdout.getvalue())

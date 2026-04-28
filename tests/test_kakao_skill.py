@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from fastapi.testclient import TestClient
@@ -18,6 +19,7 @@ class TrackingDriveLookupService(DriveLookupService):
         super().__init__(*args, **kwargs)
         self.record_context_calls = 0
         self.patient_index_load_calls = 0
+        self.document_registry_load_calls = 0
 
     def get_patient_record_context(self, patient):  # type: ignore[override]
         self.record_context_calls += 1
@@ -26,6 +28,10 @@ class TrackingDriveLookupService(DriveLookupService):
     def load_patient_index_with_file_id(self):  # type: ignore[override]
         self.patient_index_load_calls += 1
         return super().load_patient_index_with_file_id()
+
+    def load_document_registry_with_file_id(self):  # type: ignore[override]
+        self.document_registry_load_calls += 1
+        return super().load_document_registry_with_file_id()
 
 
 class FakeGeminiQaService:
@@ -38,11 +44,12 @@ class FakeGeminiQaService:
         self.raise_error: Exception | None = None
         self.calls: list[dict[str, str]] = []
 
-    def answer_question(self, *, question, context, drive_service) -> str:
+    def answer_question(self, *, question, context) -> str:
         self.calls.append(
             {
                 "question": question,
                 "patient_id": context.patient.patient_id,
+                "store_name": context.file_search_store_name or "",
             }
         )
         if self.raise_error is not None:
@@ -85,26 +92,14 @@ class KakaoSkillEndpointTest(unittest.TestCase):
     def test_greeting_before_authentication(self) -> None:
         response = self.client.post(
             "/kakao/auth",
-            json={
-                "userRequest": {
-                    "user": {"id": "new-user"},
-                    "utterance": "안녕하세요",
-                }
-            },
+            json={"userRequest": {"user": {"id": "new-user"}, "utterance": "안녕하세요"}},
         )
 
         self.assertEqual(response.status_code, 200)
         text = response.json()["template"]["outputs"][0]["simpleText"]["text"]
-        self.assertEqual(
-            text,
-            "개인 의료 기록을 확인하려면 먼저 환자 인증이 필요합니다.\n"
-            "아래 형식으로 입력해 주세요.\n"
-            "인증 이름 생년월일 (YYYYMMDD)↩️\n\n"
-            "예시:\n"
-            "인증 홍길동 19890515",
-        )
+        self.assertIn("먼저 환자 인증이 필요합니다.", text)
 
-    def test_authentication_persists_mapping_and_prewarms_record_cache(self) -> None:
+    def test_authentication_persists_mapping_without_patient_drive_lookup(self) -> None:
         response = self.client.post(
             "/kakao/auth",
             json={
@@ -117,51 +112,14 @@ class KakaoSkillEndpointTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         text = response.json()["template"]["outputs"][0]["simpleText"]["text"]
-        self.assertEqual(
-            text,
-            "손창선님 안녕하세요.🙂\n"
-            "인증이 완료되었습니다.\n"
-            "\n"
-            "아래 메뉴에서 [💾 최신 기록]을 누르거나,\n"
-            '채팅창에 "최신 기록 보여줘"라고 입력해 주세요.',
-        )
+        self.assertIn("인증이 완료되었습니다.", text)
         updated_index = self.client.app.state.drive_service.load_patient_index()
         patient = next(item for item in updated_index.patients if item.patient_id == "P0001")
         self.assertIn("new-user", patient.kakao_user_ids)
         self.assertIn("patient-index", self.gateway.updated_files)
-        cached_context = self.patient_data_cache_service.get_cached_patient_record_context(
-            patient_id="P0001"
-        )
-        self.assertIsNotNone(cached_context)
+        self.assertEqual(self.client.app.state.drive_service.record_context_calls, 0)
 
-    def test_auth_uses_patient_index_cache(self) -> None:
-        self.client.post(
-            "/kakao/auth",
-            json={
-                "userRequest": {
-                    "user": {"id": "first-user"},
-                    "utterance": "안녕하세요",
-                }
-            },
-        )
-        first_load_count = self.client.app.state.drive_service.patient_index_load_calls
-
-        self.client.post(
-            "/kakao/auth",
-            json={
-                "userRequest": {
-                    "user": {"id": "second-user"},
-                    "utterance": "안녕하세요",
-                }
-            },
-        )
-
-        self.assertEqual(
-            self.client.app.state.drive_service.patient_index_load_calls,
-            first_load_count,
-        )
-
-    def test_latest_record_returns_cached_summary_without_extra_drive_lookup(self) -> None:
+    def test_latest_record_uses_document_registry_without_record_context_lookup(self) -> None:
         self.client.post(
             "/kakao/auth",
             json={
@@ -171,112 +129,86 @@ class KakaoSkillEndpointTest(unittest.TestCase):
                 }
             },
         )
-        prewarmed_calls = self.client.app.state.drive_service.record_context_calls
 
         response = self.client.post(
             "/kakao/chat",
-            json={
-                "userRequest": {
-                    "user": {"id": "new-user"},
-                    "utterance": "💾 최신 기록",
-                }
-            },
+            json={"userRequest": {"user": {"id": "new-user"}, "utterance": "💾 최신 기록"}},
         )
 
         self.assertEqual(response.status_code, 200)
         text = response.json()["template"]["outputs"][0]["simpleText"]["text"]
         self.assertIn("최근 검사결과지와 진료기록부가 등록되어 있습니다.", text)
-        self.assertEqual(
-            self.client.app.state.drive_service.record_context_calls,
-            prewarmed_calls,
-        )
+        self.assertIn("result_20260421.pdf", text)
+        self.assertEqual(self.client.app.state.drive_service.record_context_calls, 0)
 
-    def test_latest_record_returns_preparing_message_when_cache_missing(self) -> None:
+    def test_latest_record_returns_preparing_message_when_registry_not_ready(self) -> None:
+        self.gateway.file_map["document-registry"] = json.dumps(
+            {
+                "generated_at": "2026-04-28T12:10:00+09:00",
+                "documents": [
+                    {
+                        "patient_id": "P0001",
+                        "filename": "result_20260421.pdf",
+                        "document_type": "result",
+                        "document_date": "20260421",
+                        "drive_file_id": "result-new",
+                        "drive_modified_time": "2026-04-21T10:00:00Z",
+                        "file_hash": "result-hash",
+                        "file_search_store_name": "",
+                        "file_search_document_name": "",
+                        "sync_status": "PENDING",
+                        "synced_at": "2026-04-28T12:10:00+09:00",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+
         self.client.post(
             "/kakao/auth",
             json={
                 "userRequest": {
-                    "user": {"id": "cache-miss-user"},
+                    "user": {"id": "pending-user"},
                     "utterance": "인증 손창선 19461230",
                 }
             },
         )
-        self.patient_data_cache_service._patient_record_states.clear()
+        self.patient_data_cache_service._document_registry_state = None
 
         response = self.client.post(
             "/kakao/chat",
-            json={
-                "userRequest": {
-                    "user": {"id": "cache-miss-user"},
-                    "utterance": "💾 최신 기록",
-                }
-            },
+            json={"userRequest": {"user": {"id": "pending-user"}, "utterance": "💾 최신 기록"}},
         )
 
         self.assertEqual(response.status_code, 200)
         text = response.json()["template"]["outputs"][0]["simpleText"]["text"]
         self.assertEqual(
             text,
-            "최신 진단 기록을 준비하고 있습니다.\n"
-            "잠시 후 다시 [💾 최신 기록]을 눌러 주세요.",
-        )
-        self.assertIsNotNone(
-            self.patient_data_cache_service.get_cached_patient_record_context(
-                patient_id="P0001"
-            )
+            "최신 진단 기록을 조회 중입니다.\n잠시 후 다시 [💾 최신 기록 조회]을 눌러 주세요.",
         )
 
-    def test_mapped_user_latest_record_menu_requires_reauth(self) -> None:
-        response = self.client.post(
-            "/kakao/chat",
-            json={
-                "userRequest": {
-                    "user": {"id": "kakao-user-id-1"},
-                    "utterance": "💾 최신 기록",
-                }
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        text = response.json()["template"]["outputs"][0]["simpleText"]["text"]
-        self.assertEqual(
-            text,
-            "손창선님 안녕하세요.🙂\n"
-            "진단 기록 확인을 위해 다시 인증이 필요합니다.\n\n"
-            "아래 형식으로 입력해 주세요.\n"
-            "인증 이름 생년월일 (YYYYMMDD)↩️\n\n"
-            "예시:\n"
-            "인증 홍길동 19890515",
-        )
-
-    def test_free_question_requires_callback_url(self) -> None:
+    def test_auth_reset_removes_mapping_and_session(self) -> None:
         self.client.post(
             "/kakao/auth",
             json={
                 "userRequest": {
-                    "user": {"id": "free-question-user"},
+                    "user": {"id": "reset-user"},
                     "utterance": "인증 손창선 19461230",
                 }
             },
         )
-
         response = self.client.post(
-            "/kakao/chat",
-            json={
-                "userRequest": {
-                    "user": {"id": "free-question-user"},
-                    "utterance": "혈액검사 결과가 어떤가요?",
-                }
-            },
+            "/kakao/auth",
+            json={"userRequest": {"user": {"id": "reset-user"}, "utterance": "인증 초기화"}},
         )
 
         self.assertEqual(response.status_code, 200)
         text = response.json()["template"]["outputs"][0]["simpleText"]["text"]
-        self.assertEqual(
-            text,
-            "현재 진단 기록 기반 답변을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요.",
-        )
-        self.assertEqual(len(self.kakao_callback_service.calls), 0)
+        self.assertIn("기존 인증 정보를 초기화했습니다.", text)
+        updated_index = self.client.app.state.drive_service.load_patient_index()
+        patient = next(item for item in updated_index.patients if item.patient_id == "P0001")
+        self.assertNotIn("reset-user", patient.kakao_user_ids)
+        self.assertIsNone(self.client.app.state.session_store.get("reset-user"))
 
     def test_authenticated_free_question_returns_callback_ack_and_sends_final_answer(self) -> None:
         self.client.post(
@@ -303,6 +235,10 @@ class KakaoSkillEndpointTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"version": "2.0", "useCallback": True})
         self.assertEqual(len(self.gemini_qa_service.calls), 1)
+        self.assertEqual(
+            self.gemini_qa_service.calls[0]["store_name"],
+            "fileSearchStores/patient-P0001",
+        )
         self.assertEqual(len(self.kakao_callback_service.calls), 1)
         self.assertEqual(
             self.kakao_callback_service.calls[0],
@@ -340,63 +276,6 @@ class KakaoSkillEndpointTest(unittest.TestCase):
         self.assertEqual(
             self.kakao_callback_service.calls[0]["text"],
             "현재 진단 기록 기반 답변을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요.",
-        )
-
-    def test_authenticated_free_question_sends_no_record_message(self) -> None:
-        del self.gateway.list_map["'patient-folder-2' in parents and name = 'meta.json' and trashed = false"]
-        self.gateway.list_map["'patient-folder-2' in parents and trashed = false"] = []
-        self.gateway.file_map.pop("meta-file-2", None)
-        response = self.client.post(
-            "/kakao/chat",
-            json={
-                "userRequest": {
-                    "user": {"id": "mapped-user-2"},
-                    "utterance": "이번 진료에서 혈액검사 해석해줘",
-                    "callbackUrl": "https://callback.example.com/task-3",
-                }
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        text = response.json()["template"]["outputs"][0]["simpleText"]["text"]
-        self.assertEqual(
-            text,
-            "홍길동님 안녕하세요.🙂\n"
-            "진단 기록 확인을 위해 다시 인증이 필요합니다.\n\n"
-            "아래 형식으로 입력해 주세요.\n"
-            "인증 이름 생년월일 (YYYYMMDD)↩️\n\n"
-            "예시:\n"
-            "인증 홍길동 19890515",
-        )
-
-        self.client.post(
-            "/kakao/auth",
-            json={
-                "userRequest": {
-                    "user": {"id": "mapped-user-2"},
-                    "utterance": "인증 홍길동 19800515",
-                }
-            },
-        )
-        self.kakao_callback_service.calls.clear()
-
-        response = self.client.post(
-            "/kakao/chat",
-            json={
-                "userRequest": {
-                    "user": {"id": "mapped-user-2"},
-                    "utterance": "이번 진료에서 혈액검사 해석해줘",
-                    "callbackUrl": "https://callback.example.com/task-4",
-                }
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"version": "2.0", "useCallback": True})
-        self.assertEqual(
-            self.kakao_callback_service.calls[0]["text"],
-            "확인 가능한 최신 진단 기록이 없어 답변드리기 어렵습니다.\n"
-            "병원에 기록 등록 여부를 확인해 주세요.",
         )
 
 

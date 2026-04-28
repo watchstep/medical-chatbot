@@ -11,45 +11,50 @@ from app.services.drive import DriveLookupError, build_default_drive_service
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Reconcile Google Drive patient folders into patient_index.json.",
+        description="Sync Google Drive patient folders into patient_index.json.",
     )
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Persist the reconciled patient_index.json back to Google Drive.",
+        help="Persist the synced patient_index.json back to Google Drive.",
     )
     parser.add_argument(
         "--json",
         action="store_true",
-        help="Print the reconcile result as JSON.",
+        help="Print the sync result as JSON.",
     )
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-
+def run_sync(*, apply: bool) -> dict[str, object]:
     settings = get_settings()
     drive_service = build_default_drive_service(settings)
-    try:
-        patient_index, patient_index_file_id = drive_service.load_patient_index_with_file_id()
-        result = drive_service.reconcile_patient_index()
-    except DriveLookupError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+    patient_index, patient_index_file_id = drive_service.load_patient_index_with_file_id()
+    result = drive_service.sync_patient_index()
 
-    if args.apply:
+    if apply:
         drive_service.persist_patient_index(
             patient_index_file_id=patient_index_file_id,
             patient_index=result.patient_index,
         )
 
     payload = result.to_dict()
-    payload["applied"] = args.apply
+    payload["applied"] = apply
     payload["changed"] = bool(result.added or result.updated)
     payload["existing_count"] = len(patient_index.patients)
-    payload["reconciled_count"] = len(result.patient_index.patients)
+    payload["synced_count"] = len(result.patient_index.patients)
+    return payload
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        payload = run_sync(apply=args.apply)
+    except DriveLookupError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -61,10 +66,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def format_summary(payload: dict[str, object]) -> str:
     lines = [
-        "patient_index reconcile summary",
+        "patient_index sync summary",
         f"applied: {'yes' if payload['applied'] else 'no'}",
         f"existing_count: {payload['existing_count']}",
-        f"reconciled_count: {payload['reconciled_count']}",
+        f"synced_count: {payload['synced_count']}",
         f"added: {len(payload['added'])}",
         f"updated: {len(payload['updated'])}",
         f"unchanged: {len(payload['unchanged'])}",
