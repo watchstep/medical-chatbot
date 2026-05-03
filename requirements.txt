@@ -10,7 +10,68 @@ google-auth[requests]>=2.48.1,<3.0.0
 google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.1
 
-PyMuPDF==1.25.1
-
 python-multipart==0.0.20
 httpx==0.28.1
+
+gcloud run deploy $SERVICE_NAME \
+  --source . \
+  --region $REGION \
+  --allow-unauthenticated \
+  --service-account $RUN_SA \
+  --timeout 300 \
+  --memory 1Gi \
+  --cpu 1 \
+  --set-env-vars GOOGLE_SERVICE_ACCOUNT_PATH=/credentials/google-service-account.json \
+  --set-env-vars DRIVE_ROOT_FOLDER_NAME=medical-chatbot \
+  --set-env-vars DRIVE_SYSTEM_FOLDER_NAME=_system \
+  --set-env-vars PATIENT_INDEX_FILE_NAME=patient_index.json \
+  --set-env-vars DOCUMENT_REGISTRY_FILE_NAME=document_registry.json \
+  --set-env-vars GEMINI_MODEL=gemini-3-flash-preview \
+  --set-env-vars GEMINI_TEMPERATURE=0.1 \
+  --set-env-vars GEMINI_MAX_OUTPUT_TOKENS=3072 \
+  --set-env-vars GEMINI_THINKING_LEVEL=low \
+  --set-secrets GEMINI_API_KEY=gemini-api-key:latest \
+  --update-secrets /credentials/google-service-account.json=google-service-account-json:latest
+
+  gcloud run deploy $SERVICE_NAME \
+  --source . \
+  --region $REGION \
+  --allow-unauthenticated \
+  --service-account $RUN_SA \
+  --timeout 300 \
+  --memory 1Gi \
+  --cpu 1 \
+  --set-env-vars GOOGLE_SERVICE_ACCOUNT_PATH=/credentials/google-service-account.json \
+  --set-env-vars DRIVE_ROOT_FOLDER_NAME=medical-chatbot \
+  --set-env-vars DRIVE_SYSTEM_FOLDER_NAME=_system \
+  --set-env-vars PATIENT_INDEX_FILE_NAME=patient_index.json \
+  --set-env-vars DOCUMENT_REGISTRY_FILE_NAME=document_registry.json \
+  --set-env-vars GEMINI_MODEL=gemini-3-flash-preview \
+  --set-env-vars GEMINI_TEMPERATURE=0.1 \
+  --set-env-vars GEMINI_MAX_OUTPUT_TOKENS=3072 \
+  --set-env-vars GEMINI_THINKING_LEVEL=low \
+  --set-secrets GEMINI_API_KEY=gemini-api-key:latest \
+  --update-secrets /credentials/google-service-account.json=google-service-account-json:latest
+
+
+  curl -X POST "$SERVICE_URL/kakao/chat" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userRequest": {
+      "user": {
+        "id": "test-user-001"
+      },
+      "utterance": "검사 결과 알려줘"
+    }
+  }'
+
+  curl -X POST "$SERVICE_URL/kakao/auth" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userRequest": {
+      "user": {
+        "id": "test-user-001"
+      },
+      "utterance": "인증 홍길동 19890515"
+    }
+  }'
