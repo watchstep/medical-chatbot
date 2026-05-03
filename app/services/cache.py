@@ -11,7 +11,6 @@ from app.schemas import (
     PatientDocumentRegistryContext,
     PatientIndex,
     PatientIndexEntry,
-    PatientRecordContext,
 )
 from app.services.drive import DriveLookupError, DriveLookupService
 from app.services.gemini_qa import is_file_search_store_name
@@ -25,12 +24,6 @@ KST = timezone(timedelta(hours=9))
 class CachedPatientIndexState:
     patient_index: PatientIndex
     patient_index_file_id: str
-    expires_at: datetime
-
-
-@dataclass
-class CachedPatientRecordState:
-    context: PatientRecordContext
     expires_at: datetime
 
 
@@ -58,7 +51,6 @@ class PatientDataCacheService:
         self.drive_service = drive_service
         self._patient_index_state: CachedPatientIndexState | None = None
         self._document_registry_state: CachedDocumentRegistryState | None = None
-        self._patient_record_states: dict[str, CachedPatientRecordState] = {}
 
     def get_patient_by_kakao_user_id(self, kakao_user_id: str) -> PatientIndexEntry | None:
         patient_index = self._get_patient_index()
@@ -161,48 +153,6 @@ class PatientDataCacheService:
             )
         return changed
 
-    def get_cached_patient_record_context(
-        self,
-        *,
-        patient_id: str,
-        allow_stale: bool = False,
-    ) -> PatientRecordContext | None:
-        state = self._patient_record_states.get(patient_id)
-        if state is None:
-            logger.info("patient_record_cache miss patient_id=%s", patient_id)
-            return None
-        if state.expires_at > datetime.now(KST):
-            logger.info("patient_record_cache hit patient_id=%s", patient_id)
-            return state.context
-        if allow_stale:
-            logger.info("patient_record_cache stale patient_id=%s", patient_id)
-            return state.context
-        logger.info("patient_record_cache expired patient_id=%s", patient_id)
-        return None
-
-    def warm_patient_record_context(self, patient: PatientIndexEntry) -> PatientRecordContext:
-        logger.info("patient_record_cache warm patient_id=%s", patient.patient_id)
-        context = self.drive_service.get_patient_record_context(patient=patient)
-        self._patient_record_states[patient.patient_id] = CachedPatientRecordState(
-            context=context,
-            expires_at=self._build_patient_record_expiry(),
-        )
-        return context
-
-    def get_or_fetch_patient_record_context(
-        self,
-        *,
-        patient: PatientIndexEntry,
-        allow_stale: bool = False,
-    ) -> PatientRecordContext:
-        cached = self.get_cached_patient_record_context(
-            patient_id=patient.patient_id,
-            allow_stale=allow_stale,
-        )
-        if cached is not None:
-            return cached
-        return self.warm_patient_record_context(patient)
-
     def _get_patient_index(self) -> PatientIndex:
         return self._get_patient_index_state().patient_index
 
@@ -228,9 +178,6 @@ class PatientDataCacheService:
         return datetime.now(KST) + timedelta(
             seconds=self.settings.document_registry_cache_ttl_seconds
         )
-
-    def _build_patient_record_expiry(self) -> datetime:
-        return datetime.now(KST) + timedelta(seconds=self.settings.patient_record_cache_ttl_seconds)
 
     def _get_document_registry_state(self) -> CachedDocumentRegistryState:
         now = datetime.now(KST)

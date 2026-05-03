@@ -7,9 +7,10 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from app.schemas import Block, ModelAnswer
 from app.services.cache import PatientDataCacheService
 from app.services.drive import DriveLookupService
-from app.services.gemini_qa import GeminiQaError
+from app.services.gemini_qa import GeminiQaAnswer, GeminiQaError
 from app.sessions import InMemorySessionStore
 from tests.test_drive_service import FakeDriveGateway
 
@@ -17,13 +18,8 @@ from tests.test_drive_service import FakeDriveGateway
 class TrackingDriveLookupService(DriveLookupService):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.record_context_calls = 0
         self.patient_index_load_calls = 0
         self.document_registry_load_calls = 0
-
-    def get_patient_record_context(self, patient):  # type: ignore[override]
-        self.record_context_calls += 1
-        return super().get_patient_record_context(patient)
 
     def load_patient_index_with_file_id(self):  # type: ignore[override]
         self.patient_index_load_calls += 1
@@ -36,15 +32,24 @@ class TrackingDriveLookupService(DriveLookupService):
 
 class FakeGeminiQaService:
     def __init__(self) -> None:
-        self.answer = (
-            "핵심 답변: 최근 기록에서 혈압 관련 수치는 확인되지 않습니다.\n"
-            "근거 문서: result_20260421.pdf, chart_20260421.pdf\n"
-            "확인할 점: 담당 의료진에게 혈압 수치와 추적 계획을 확인해 주세요."
+        self.answer = GeminiQaAnswer(
+            model_answer=ModelAnswer(
+                status="ok",
+                blocks=[
+                    Block(
+                        type="paragraph",
+                        text="최근 기록에서 혈압 관련 수치는 확인되지 않습니다.",
+                    )
+                ],
+                used_source_ids=["chart_20260421.pdf"],
+                show_sources=True,
+            ),
+            grounding_source_ids=["chart_20260421.pdf"],
         )
         self.raise_error: Exception | None = None
         self.calls: list[dict[str, str]] = []
 
-    def answer_question(self, *, question, context) -> str:
+    def answer_question(self, *, question, context) -> GeminiQaAnswer:
         self.calls.append(
             {
                 "question": question,
@@ -117,9 +122,8 @@ class KakaoSkillEndpointTest(unittest.TestCase):
         patient = next(item for item in updated_index.patients if item.patient_id == "P0001")
         self.assertIn("new-user", patient.kakao_user_ids)
         self.assertIn("patient-index", self.gateway.updated_files)
-        self.assertEqual(self.client.app.state.drive_service.record_context_calls, 0)
 
-    def test_latest_record_uses_document_registry_without_record_context_lookup(self) -> None:
+    def test_latest_record_uses_document_registry(self) -> None:
         self.client.post(
             "/kakao/auth",
             json={
@@ -139,7 +143,7 @@ class KakaoSkillEndpointTest(unittest.TestCase):
         text = response.json()["template"]["outputs"][0]["simpleText"]["text"]
         self.assertIn("최근 검사결과지와 진료기록부가 등록되어 있습니다.", text)
         self.assertIn("result_20260421.pdf", text)
-        self.assertEqual(self.client.app.state.drive_service.record_context_calls, 0)
+        self.assertEqual(self.client.app.state.drive_service.document_registry_load_calls, 1)
 
     def test_latest_record_returns_preparing_message_when_registry_not_ready(self) -> None:
         self.gateway.file_map["document-registry"] = json.dumps(
@@ -244,8 +248,287 @@ class KakaoSkillEndpointTest(unittest.TestCase):
             self.kakao_callback_service.calls[0],
             {
                 "callback_url": "https://callback.example.com/task-1",
-                "text": self.gemini_qa_service.answer,
+                "text": (
+                    "최근 기록에서 혈압 관련 수치는 확인되지 않습니다.\n\n"
+                    "📄 출처 (1건)\n"
+                    "1. 진료기록부, 2026년 4월 21일 (chart_20260421.pdf)"
+                ),
             },
+        )
+
+    def test_authenticated_free_question_renders_bullet_list_without_emoji(self) -> None:
+        self.client.post(
+            "/kakao/auth",
+            json={
+                "userRequest": {
+                    "user": {"id": "bullet-user"},
+                    "utterance": "인증 손창선 19461230",
+                }
+            },
+        )
+        self.gemini_qa_service.answer = GeminiQaAnswer(
+            model_answer=ModelAnswer(
+                status="ok",
+                blocks=[
+                    Block(
+                        type="bullet_list",
+                        items=[
+                            "Hemoglobin은 참고치보다 낮게 확인됩니다.",
+                            "BUN은 참고치보다 높게 확인됩니다.",
+                        ],
+                    )
+                ],
+                used_source_ids=["result_20260421.pdf"],
+                show_sources=True,
+            ),
+            grounding_source_ids=["result_20260421.pdf"],
+        )
+
+        self.client.post(
+            "/kakao/chat",
+            json={
+                "userRequest": {
+                    "user": {"id": "bullet-user"},
+                    "utterance": "혈액검사 결과가 어떤가요?",
+                    "callbackUrl": "https://callback.example.com/task-bullet",
+                }
+            },
+        )
+
+        self.assertEqual(
+            self.kakao_callback_service.calls[0]["text"],
+            (
+                "- Hemoglobin은 참고치보다 낮게 확인됩니다.\n"
+                "- BUN은 참고치보다 높게 확인됩니다.\n\n"
+                "📄 출처 (1건)\n"
+                "1. 검사결과지, 2026년 4월 21일 (result_20260421.pdf)"
+            ),
+        )
+        self.assertNotIn("📊", self.kakao_callback_service.calls[0]["text"])
+        self.assertNotIn("💊", self.kakao_callback_service.calls[0]["text"])
+
+    def test_authenticated_free_question_dedupes_sources_and_uses_intersection(self) -> None:
+        self.client.post(
+            "/kakao/auth",
+            json={
+                "userRequest": {
+                    "user": {"id": "source-dedupe-user"},
+                    "utterance": "인증 손창선 19461230",
+                }
+            },
+        )
+        self.gemini_qa_service.answer = GeminiQaAnswer(
+            model_answer=ModelAnswer(
+                status="ok",
+                blocks=[Block(type="paragraph", text="진료기록에서 관련 내용이 확인됩니다.")],
+                used_source_ids=["chart_20260421.pdf", "chart_20260421.pdf"],
+                show_sources=True,
+            ),
+            grounding_source_ids=["result_20260421.pdf", "chart_20260421.pdf"],
+        )
+
+        self.client.post(
+            "/kakao/chat",
+            json={
+                "userRequest": {
+                    "user": {"id": "source-dedupe-user"},
+                    "utterance": "진료 기록에 관련 내용이 있나요?",
+                    "callbackUrl": "https://callback.example.com/task-source",
+                }
+            },
+        )
+
+        self.assertEqual(
+            self.kakao_callback_service.calls[0]["text"],
+            (
+                "진료기록에서 관련 내용이 확인됩니다.\n\n"
+                "📄 출처 (1건)\n"
+                "1. 진료기록부, 2026년 4월 21일 (chart_20260421.pdf)"
+            ),
+        )
+
+    def test_authenticated_free_question_blocks_wrong_model_source(self) -> None:
+        self.client.post(
+            "/kakao/auth",
+            json={
+                "userRequest": {
+                    "user": {"id": "wrong-source-user"},
+                    "utterance": "인증 손창선 19461230",
+                }
+            },
+        )
+        self.gemini_qa_service.answer = GeminiQaAnswer(
+            model_answer=ModelAnswer(
+                status="ok",
+                blocks=[Block(type="paragraph", text="진료기록에서 관련 내용이 확인됩니다.")],
+                used_source_ids=["chart_20260421.pdf", "unknown_20260421.pdf"],
+                show_sources=True,
+            ),
+            grounding_source_ids=["chart_20260421.pdf"],
+        )
+
+        self.client.post(
+            "/kakao/chat",
+            json={
+                "userRequest": {
+                    "user": {"id": "wrong-source-user"},
+                    "utterance": "진료 기록에 관련 내용이 있나요?",
+                    "callbackUrl": "https://callback.example.com/task-wrong-source",
+                }
+            },
+        )
+
+        self.assertEqual(
+            self.kakao_callback_service.calls[0]["text"],
+            "해당 내용은 제공된 진단 기록에서 확인하기 어렵습니다.",
+        )
+
+    def test_authenticated_free_question_allows_missing_grounding_source_when_model_source_is_ready(self) -> None:
+        self.client.post(
+            "/kakao/auth",
+            json={
+                "userRequest": {
+                    "user": {"id": "missing-grounding-user"},
+                    "utterance": "인증 손창선 19461230",
+                }
+            },
+        )
+        self.gemini_qa_service.answer = GeminiQaAnswer(
+            model_answer=ModelAnswer(
+                status="ok",
+                blocks=[Block(type="paragraph", text="진료기록에서 관련 내용이 확인됩니다.")],
+                used_source_ids=["chart_20260421.pdf"],
+                show_sources=True,
+            ),
+            grounding_source_ids=[],
+        )
+
+        self.client.post(
+            "/kakao/chat",
+            json={
+                "userRequest": {
+                    "user": {"id": "missing-grounding-user"},
+                    "utterance": "진료 기록에 관련 내용이 있나요?",
+                    "callbackUrl": "https://callback.example.com/task-missing-grounding",
+                }
+            },
+        )
+
+        self.assertEqual(
+            self.kakao_callback_service.calls[0]["text"],
+            (
+                "진료기록에서 관련 내용이 확인됩니다.\n\n"
+                "📄 출처 (1건)\n"
+                "1. 진료기록부, 2026년 4월 21일 (chart_20260421.pdf)"
+            ),
+        )
+
+    def test_authenticated_free_question_blocks_private_info_output(self) -> None:
+        self.client.post(
+            "/kakao/auth",
+            json={
+                "userRequest": {
+                    "user": {"id": "private-output-user"},
+                    "utterance": "인증 손창선 19461230",
+                }
+            },
+        )
+        self.gemini_qa_service.answer = GeminiQaAnswer(
+            model_answer=ModelAnswer(
+                status="ok",
+                blocks=[Block(type="paragraph", text="환자번호 12345가 기록되어 있습니다.")],
+                used_source_ids=["chart_20260421.pdf"],
+                show_sources=True,
+            ),
+            grounding_source_ids=["chart_20260421.pdf"],
+        )
+
+        self.client.post(
+            "/kakao/chat",
+            json={
+                "userRequest": {
+                    "user": {"id": "private-output-user"},
+                    "utterance": "환자 번호가 있나요?",
+                    "callbackUrl": "https://callback.example.com/task-private",
+                }
+            },
+        )
+
+        self.assertEqual(
+            self.kakao_callback_service.calls[0]["text"],
+            "⚠️ 개인정보 보호 정책에 따라 성함 이외의 세부 개인정보는 안내해 드리지 않습니다.",
+        )
+
+    def test_authenticated_free_question_rejects_forbidden_source_token_in_blocks(self) -> None:
+        self.client.post(
+            "/kakao/auth",
+            json={
+                "userRequest": {
+                    "user": {"id": "forbidden-token-user"},
+                    "utterance": "인증 손창선 19461230",
+                }
+            },
+        )
+        self.gemini_qa_service.answer = GeminiQaAnswer(
+            model_answer=ModelAnswer(
+                status="ok",
+                blocks=[Block(type="paragraph", text="chart_20260421.pdf에서 확인됩니다.")],
+                used_source_ids=["chart_20260421.pdf"],
+                show_sources=True,
+            ),
+            grounding_source_ids=["chart_20260421.pdf"],
+        )
+
+        self.client.post(
+            "/kakao/chat",
+            json={
+                "userRequest": {
+                    "user": {"id": "forbidden-token-user"},
+                    "utterance": "진료 기록에 관련 내용이 있나요?",
+                    "callbackUrl": "https://callback.example.com/task-forbidden-token",
+                }
+            },
+        )
+
+        self.assertEqual(
+            self.kakao_callback_service.calls[0]["text"],
+            "해당 내용은 제공된 진단 기록에서 확인하기 어렵습니다.",
+        )
+
+    def test_authenticated_free_question_uses_fixed_message_for_non_ok_status(self) -> None:
+        self.client.post(
+            "/kakao/auth",
+            json={
+                "userRequest": {
+                    "user": {"id": "non-ok-status-user"},
+                    "utterance": "인증 손창선 19461230",
+                }
+            },
+        )
+        self.gemini_qa_service.answer = GeminiQaAnswer(
+            model_answer=ModelAnswer(
+                status="cost_block",
+                blocks=[Block(type="paragraph", text="이 blocks는 출력되면 안 됩니다.")],
+                used_source_ids=["chart_20260421.pdf"],
+                show_sources=True,
+            ),
+            grounding_source_ids=["chart_20260421.pdf"],
+        )
+
+        self.client.post(
+            "/kakao/chat",
+            json={
+                "userRequest": {
+                    "user": {"id": "non-ok-status-user"},
+                    "utterance": "보험금 청구 금액 알려줘",
+                    "callbackUrl": "https://callback.example.com/task-status",
+                }
+            },
+        )
+
+        self.assertEqual(
+            self.kakao_callback_service.calls[0]["text"],
+            "⚠️ 비용 관련 정보는 해당 의료기관에 직접 문의하셔야 합니다.",
         )
 
     def test_authenticated_free_question_sends_safe_message_on_gemini_error(self) -> None:

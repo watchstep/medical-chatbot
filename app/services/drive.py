@@ -16,16 +16,12 @@ from app.schemas import (
     DocumentRegistry,
     DocumentRegistryEntry,
     DriveFile,
-    PatientFileMeta,
     PatientIndex,
     PatientIndexEntry,
-    PatientMeta,
-    PatientRecordContext,
 )
 
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
-PDF_FILE_RE = re.compile(r"^(result|chart|image)_(\d{8})\.pdf$")
 PATIENT_FOLDER_RE = re.compile(r"^(?P<patient_id>[^_]+)_(?P<name>.+)_(?P<birth>\d{8})$")
 logger = logging.getLogger(__name__)
 
@@ -288,19 +284,16 @@ class DriveLookupService:
             if patient is not None:
                 if kakao_user_id:
                     result["authenticated_by"] = "kakao_user_id" if kakao_user_id in patient.kakao_user_ids else "identity"
-                context = self.get_patient_record_context(
-                    patient=patient,
-                )
+                latest_result, latest_chart = self._latest_ready_documents_for_patient(patient)
                 result["authenticated_patient_id"] = patient.patient_id
                 result["authenticated_folder_name"] = patient.folder_name
                 result["authenticated_folder_id"] = patient.folder_id
-                result["latest_visit_date"] = context.meta.latest_visit_date
-                result["latest_result"] = (
-                    context.latest_result.name if context.latest_result else None
+                result["latest_visit_date"] = self._latest_document_date(
+                    latest_result,
+                    latest_chart,
                 )
-                result["latest_chart"] = (
-                    context.latest_chart.name if context.latest_chart else None
-                )
+                result["latest_result"] = latest_result.filename if latest_result else None
+                result["latest_chart"] = latest_chart.filename if latest_chart else None
             elif kakao_user_id and name and birth:
                 patient = self.authenticate_and_map_patient(
                     kakao_user_id=kakao_user_id,
@@ -310,19 +303,16 @@ class DriveLookupService:
                 result["mapping_found"] = False
                 result["mapping_saved"] = True
                 result["authenticated_by"] = "identity"
-                context = self.get_patient_record_context(
-                    patient=patient,
-                )
+                latest_result, latest_chart = self._latest_ready_documents_for_patient(patient)
                 result["authenticated_patient_id"] = patient.patient_id
                 result["authenticated_folder_name"] = patient.folder_name
                 result["authenticated_folder_id"] = patient.folder_id
-                result["latest_visit_date"] = context.meta.latest_visit_date
-                result["latest_result"] = (
-                    context.latest_result.name if context.latest_result else None
+                result["latest_visit_date"] = self._latest_document_date(
+                    latest_result,
+                    latest_chart,
                 )
-                result["latest_chart"] = (
-                    context.latest_chart.name if context.latest_chart else None
-                )
+                result["latest_result"] = latest_result.filename if latest_result else None
+                result["latest_chart"] = latest_chart.filename if latest_chart else None
         except DriveLookupError as exc:
             result["ok"] = False
             result["error"] = str(exc)
@@ -528,36 +518,39 @@ class DriveLookupService:
                 detail=str(exc),
             ) from exc
 
-    def get_patient_record_context(
+    def _latest_ready_documents_for_patient(
         self,
         patient: PatientIndexEntry,
-    ) -> PatientRecordContext:
-        try:
-            patient_folder_id = self._get_patient_folder_id(patient)
-            files = self.gateway.list_files(
-                f"'{patient_folder_id}' in parents and trashed = false"
-            )
-            document_files = self._extract_document_files(files)
-            latest_result, latest_chart = self._select_latest_documents(files)
-            meta = self._load_or_build_meta(
-                patient=patient,
-                patient_folder_id=patient_folder_id,
-                document_files=document_files,
-            )
-            return PatientRecordContext(
-                patient=patient,
-                meta=meta,
-                latest_result=latest_result,
-                latest_chart=latest_chart,
-            )
-        except DriveLookupError:
-            raise
-        except Exception as exc:
-            logger.exception("Failed to load patient record context")
-            raise DriveLookupError(
-                "환자 기록 조회에 실패했습니다.",
-                detail=str(exc),
-            ) from exc
+    ) -> tuple[DocumentRegistryEntry | None, DocumentRegistryEntry | None]:
+        registry = self.load_document_registry()
+        ready_documents = [
+            item
+            for item in registry.documents
+            if item.patient_id == patient.patient_id and item.sync_status == "READY"
+        ]
+        return (
+            self._latest_document_by_type(ready_documents, "result"),
+            self._latest_document_by_type(ready_documents, "chart"),
+        )
+
+    def _latest_document_by_type(
+        self,
+        documents: list[DocumentRegistryEntry],
+        document_type: str,
+    ) -> DocumentRegistryEntry | None:
+        matches = [item for item in documents if item.document_type == document_type]
+        if not matches:
+            return None
+        return max(matches, key=lambda item: (item.document_date, item.filename))
+
+    def _latest_document_date(
+        self,
+        *documents: DocumentRegistryEntry | None,
+    ) -> str | None:
+        dates = [item.document_date for item in documents if item is not None and item.document_date]
+        if not dates:
+            return None
+        return max(dates)
 
     def download_drive_file_bytes(self, drive_file: DriveFile) -> bytes:
         try:
@@ -585,25 +578,6 @@ class DriveLookupService:
                 "환자 문서 목록 조회에 실패했습니다.",
                 detail=str(exc),
             ) from exc
-
-    def _load_or_build_meta(
-        self,
-        patient: PatientIndexEntry,
-        patient_folder_id: str,
-        document_files: list[PatientFileMeta],
-    ) -> PatientMeta:
-        if document_files:
-            return self._build_patient_meta(patient, document_files)
-
-        meta_file_id = self._find_optional_file_id(
-            parent_id=patient_folder_id,
-            file_name=self.settings.meta_file_name,
-        )
-        if meta_file_id is None:
-            raise DriveLookupError("환자 폴더에 조회 가능한 PDF가 없습니다.")
-
-        meta_content = self.gateway.download_file_bytes(meta_file_id)
-        return PatientMeta.model_validate(json.loads(meta_content.decode("utf-8")))
 
     def _save_patient_index(self, patient_index_file_id: str, patient_index: PatientIndex) -> None:
         try:
@@ -785,109 +759,6 @@ class DriveLookupService:
         if not files:
             return None
         return files[0]["id"]
-
-    def _select_latest_documents(
-        self,
-        files: list[dict],
-    ) -> tuple[DriveFile | None, DriveFile | None]:
-        latest_by_type: dict[str, DriveFile] = {}
-
-        for file in files:
-            if file.get("mimeType") == FOLDER_MIME:
-                continue
-
-            match = PDF_FILE_RE.match(file.get("name", ""))
-            if match is None:
-                continue
-
-            document_type, date = match.groups()
-            drive_file = DriveFile(
-                file_id=file["id"],
-                name=file["name"],
-                mime_type=file["mimeType"],
-                date=date,
-                type=document_type,
-            )
-
-            current = latest_by_type.get(document_type)
-            if current is None or (current.date or "") < date:
-                latest_by_type[document_type] = drive_file
-
-        return latest_by_type.get("result"), latest_by_type.get("chart")
-
-    def _extract_document_files(self, files: list[dict]) -> list[PatientFileMeta]:
-        document_files: list[PatientFileMeta] = []
-        for file in files:
-            if file.get("mimeType") == FOLDER_MIME:
-                continue
-            match = PDF_FILE_RE.match(file.get("name", ""))
-            if match is None:
-                continue
-            document_type, date = match.groups()
-            description = self._file_description(document_type)
-            document_files.append(
-                PatientFileMeta(
-                    type=document_type,
-                    date=date,
-                    filename=file["name"],
-                    description=description,
-                    file_id=file.get("id"),
-                )
-            )
-        document_files.sort(key=lambda item: (item.date, item.filename), reverse=True)
-        return document_files
-
-    def _build_patient_meta(
-        self,
-        patient: PatientIndexEntry,
-        document_files: list[PatientFileMeta],
-    ) -> PatientMeta:
-        latest_visit_date = max(file.date for file in document_files)
-        latest_summary = self._build_latest_summary(
-            latest_visit_date=latest_visit_date,
-            document_files=document_files,
-        )
-        return PatientMeta(
-            patient_id=patient.patient_id,
-            name=patient.name,
-            birth=patient.birth,
-            latest_visit_date=latest_visit_date,
-            files=document_files,
-            latest_summary=latest_summary,
-        )
-
-    def _build_latest_summary(
-        self,
-        latest_visit_date: str,
-        document_files: list[PatientFileMeta],
-    ) -> dict[str, str]:
-        document_types = {file.type for file in document_files}
-        if {"result", "chart"}.issubset(document_types):
-            description = "최근 검사결과지와 진료기록부가 등록되어 있습니다."
-        elif "result" in document_types:
-            description = "최근 검사결과지가 등록되어 있습니다."
-        elif "chart" in document_types:
-            description = "최근 진료기록부가 등록되어 있습니다."
-        else:
-            description = "최근 진료 기록이 등록되어 있습니다."
-
-        return {
-            "date": latest_visit_date,
-            "title": (
-                f"{latest_visit_date[:4]}년 {int(latest_visit_date[4:6])}월 "
-                f"{int(latest_visit_date[6:8])}일 진료 및 검사 기록"
-            ),
-            "description": description,
-        }
-
-    def _file_description(self, document_type: str) -> str:
-        if document_type == "result":
-            return "검사결과지"
-        if document_type == "chart":
-            return "진료기록부"
-        if document_type == "image":
-            return "영상 판독 문서"
-        return "의료 문서"
 
 
 def build_default_drive_service(settings: Settings) -> DriveLookupService:

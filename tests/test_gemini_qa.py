@@ -4,13 +4,17 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from google.genai import types as genai_types
+
 from app.config import Settings
-from app.schemas import DocumentRegistryEntry, PatientDocumentRegistryContext, PatientIndexEntry
+from app.schemas import DocumentRegistryEntry, ModelAnswer, PatientDocumentRegistryContext, PatientIndexEntry
 from app.services.gemini_qa import (
     FileSearchStoreDocument,
     GoogleGeminiGateway,
     GeminiDocument,
+    GeminiGenerateResult,
     GeminiGateway,
+    GeminiQaAnswer,
     GeminiPatientStoreSyncService,
     GeminiQaError,
     GeminiQaService,
@@ -21,9 +25,8 @@ from app.services.gemini_qa import (
 class FakeGeminiGateway(GeminiGateway):
     def __init__(self) -> None:
         self.answer = (
-            "핵심 답변: 제공된 진단 기록 문서에서 해당 내용을 확인하지 못했습니다.\n"
-            "근거 문서: result_20260421.pdf, chart_20260421.pdf\n"
-            "확인할 점: 담당 의료진에게 직접 확인해 주세요."
+            '{"status":"ok","blocks":[{"type":"paragraph","text":"제공된 진단 기록에서 혈액검사 결과가 확인됩니다."}],'
+            '"used_source_ids":["result_20260421.pdf"],"show_sources":true}'
         )
         self.raise_error: Exception | None = None
         self.created_stores: list[str] = []
@@ -92,28 +95,33 @@ class FakeGeminiGateway(GeminiGateway):
         system_instruction: str,
         prompt: str,
         file_search_store_name: str,
+        response_json_schema: dict[str, object],
         temperature: float,
         max_output_tokens: int,
-        thinking_budget: int | None,
+        thinking_level: str,
         file_search_top_k: int,
         log_retrieval: bool,
-    ) -> str:
+    ) -> GeminiGenerateResult:
         self.generate_calls.append(
             {
                 "model": model,
                 "system_instruction": system_instruction,
                 "prompt": prompt,
                 "file_search_store_name": file_search_store_name,
+                "response_json_schema": response_json_schema,
                 "temperature": temperature,
                 "max_output_tokens": max_output_tokens,
-                "thinking_budget": thinking_budget,
+                "thinking_level": thinking_level,
                 "file_search_top_k": file_search_top_k,
                 "log_retrieval": log_retrieval,
             }
         )
         if self.raise_error is not None:
             raise self.raise_error
-        return self.answer
+        return GeminiGenerateResult(
+            text=self.answer,
+            grounding_source_ids=["result_20260421.pdf"],
+        )
 
 
 class GeminiQaServiceTest(unittest.TestCase):
@@ -121,10 +129,10 @@ class GeminiQaServiceTest(unittest.TestCase):
         self.settings = Settings(
             google_service_account_path="credentials/google-service-account.json",
             gemini_api_key="test-key",
-            gemini_model="gemini-test-model",
+            gemini_model="gemini-3-flash-preview",
             gemini_temperature=0.1,
             gemini_max_output_tokens=700,
-            gemini_thinking_budget=0,
+            gemini_thinking_level="minimal",
             gemini_file_search_top_k=5,
             gemini_file_search_chunk_max_tokens=512,
             gemini_file_search_chunk_overlap_tokens=100,
@@ -145,20 +153,31 @@ class GeminiQaServiceTest(unittest.TestCase):
             context=context,
         )
 
-        self.assertEqual(answer, self.gateway.answer)
+        self.assertIsInstance(answer, GeminiQaAnswer)
+        self.assertEqual(answer.model_answer.status, "ok")
+        self.assertEqual(answer.model_answer.blocks[0].text, "제공된 진단 기록에서 혈액검사 결과가 확인됩니다.")
+        self.assertEqual(answer.model_answer.used_source_ids, ["result_20260421.pdf"])
+        self.assertEqual(answer.grounding_source_ids, ["result_20260421.pdf"])
         self.assertEqual(
             self.gateway.generate_calls[0]["file_search_store_name"],
             "fileSearchStores/patient-P0001",
         )
-        self.assertIn("당신은 의료 문서 기반 질의응답 도우미입니다", self.gateway.generate_calls[0]["system_instruction"])
-        self.assertIn("아래 PDF 파일들은 동일 환자의 최신 진단 기록입니다.", self.gateway.generate_calls[0]["prompt"])
-        self.assertIn("result_20260421.pdf (검사결과지, 문서 날짜: 20260421)", self.gateway.generate_calls[0]["prompt"])
-        self.assertIn("chart_20260421.pdf (진료기록부, 문서 날짜: 20260421)", self.gateway.generate_calls[0]["prompt"])
-        self.assertIn("근거 문서 표시 규칙", self.gateway.generate_calls[0]["prompt"])
+        self.assertIn("반드시 JSON 객체 하나만 반환합니다", self.gateway.generate_calls[0]["system_instruction"])
+        self.assertIn("동일 환자의 File Search Store 문서 목록입니다.", self.gateway.generate_calls[0]["prompt"])
+        self.assertIn("source_id: result_20260421.pdf", self.gateway.generate_calls[0]["prompt"])
+        self.assertIn("source_id: chart_20260421.pdf", self.gateway.generate_calls[0]["prompt"])
+        self.assertIn("used_source_ids", self.gateway.generate_calls[0]["prompt"])
         self.assertIn("사용자 질문", self.gateway.generate_calls[0]["prompt"])
+        self.assertEqual(self.gateway.generate_calls[0]["model"], "gemini-3-flash-preview")
+        schema = self.gateway.generate_calls[0]["response_json_schema"]
+        self.assertEqual(schema["properties"]["status"]["type"], "string")
+        self.assertIn("blocks", schema["properties"])
+        self.assertIn("used_source_ids", schema["properties"])
+        self.assertIn("show_sources", schema["properties"])
+        self.assertNotIn("style", str(schema))
         self.assertEqual(self.gateway.generate_calls[0]["temperature"], 0.1)
         self.assertEqual(self.gateway.generate_calls[0]["max_output_tokens"], 700)
-        self.assertEqual(self.gateway.generate_calls[0]["thinking_budget"], 0)
+        self.assertEqual(self.gateway.generate_calls[0]["thinking_level"], "minimal")
         self.assertEqual(self.gateway.generate_calls[0]["file_search_top_k"], 5)
         self.assertTrue(self.gateway.generate_calls[0]["log_retrieval"])
 
@@ -170,7 +189,7 @@ class GeminiQaServiceTest(unittest.TestCase):
                 gemini_model="gemini-test-model",
                 gemini_temperature=0.2,
                 gemini_max_output_tokens=1024,
-                gemini_thinking_budget=256,
+                gemini_thinking_level="medium",
                 gemini_file_search_top_k=7,
                 gemini_file_search_log_retrieval=False,
             ),
@@ -185,7 +204,7 @@ class GeminiQaServiceTest(unittest.TestCase):
 
         self.assertEqual(self.gateway.generate_calls[0]["temperature"], 0.2)
         self.assertEqual(self.gateway.generate_calls[0]["max_output_tokens"], 1024)
-        self.assertEqual(self.gateway.generate_calls[0]["thinking_budget"], 256)
+        self.assertEqual(self.gateway.generate_calls[0]["thinking_level"], "medium")
         self.assertEqual(self.gateway.generate_calls[0]["file_search_top_k"], 7)
         self.assertFalse(self.gateway.generate_calls[0]["log_retrieval"])
 
@@ -201,6 +220,46 @@ class GeminiQaServiceTest(unittest.TestCase):
     def test_answer_question_wraps_gateway_error(self) -> None:
         context = self._build_context(store_name="fileSearchStores/patient-P0001")
         self.gateway.raise_error = RuntimeError("gateway failed")
+
+        with self.assertRaises(GeminiQaError):
+            self.qa_service.answer_question(
+                question="이번 기록에서 혈액검사 이상이 있나요?",
+                context=context,
+            )
+
+    def test_settings_default_gemini_model_uses_gemini_3_flash_preview(self) -> None:
+        settings = Settings(_env_file=None)
+
+        self.assertEqual(settings.gemini_model, "gemini-3-flash-preview")
+        self.assertEqual(settings.gemini_thinking_level, "minimal")
+
+    def test_answer_question_rejects_non_json_answer(self) -> None:
+        context = self._build_context(store_name="fileSearchStores/patient-P0001")
+        self.gateway.answer = "자유 텍스트 답변"
+
+        with self.assertRaises(GeminiQaError):
+            self.qa_service.answer_question(
+                question="이번 기록에서 혈액검사 이상이 있나요?",
+                context=context,
+            )
+
+    def test_answer_question_rejects_invalid_schema(self) -> None:
+        context = self._build_context(store_name="fileSearchStores/patient-P0001")
+        self.gateway.answer = '{"status":"ok","blocks":[{"type":"paragraph"}],"used_source_ids":[],"show_sources":true}'
+
+        with self.assertRaises(GeminiQaError):
+            self.qa_service.answer_question(
+                question="이번 기록에서 혈액검사 이상이 있나요?",
+                context=context,
+            )
+
+    def test_answer_question_rejects_legacy_bullet_style(self) -> None:
+        context = self._build_context(store_name="fileSearchStores/patient-P0001")
+        self.gateway.answer = (
+            '{"status":"ok","blocks":[{"type":"bullet_list","style":"lab",'
+            '"items":["Hemoglobin은 참고치보다 낮게 확인됩니다."]}],'
+            '"used_source_ids":["result_20260421.pdf"],"show_sources":true}'
+        )
 
         with self.assertRaises(GeminiQaError):
             self.qa_service.answer_question(
@@ -429,6 +488,17 @@ class FakeModelsApi:
         if self.next_response is not None:
             return self.next_response
         return SimpleNamespace(text="답변")
+
+
+class GoogleGenaiSdkConfigTest(unittest.TestCase):
+    def test_generate_content_config_accepts_response_json_schema_field(self) -> None:
+        config = genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=ModelAnswer.model_json_schema(),
+        )
+
+        self.assertEqual(config.response_mime_type, "application/json")
+        self.assertIn("status", config.response_json_schema["properties"])
 
 
 class GoogleGeminiGatewayTest(unittest.TestCase):
@@ -698,29 +768,38 @@ class GoogleGeminiGatewayTest(unittest.TestCase):
 
     def test_generate_answer_uses_file_search_tool(self) -> None:
         answer = self.gateway.generate_answer(
-            model="gemini-2.5-flash",
+            model="gemini-3-flash-preview",
             system_instruction="시스템 지시",
             prompt="질문",
             file_search_store_name="fileSearchStores/patient-P0001",
+            response_json_schema=ModelAnswer.model_json_schema(),
             temperature=0.2,
             max_output_tokens=1024,
-            thinking_budget=0,
+            thinking_level="minimal",
             file_search_top_k=7,
             log_retrieval=True,
         )
 
-        self.assertEqual(answer, "답변")
+        self.assertEqual(answer.text, "답변")
+        self.assertEqual(answer.grounding_source_ids, [])
         self.assertEqual(len(self.models.calls), 1)
         config = self.models.calls[0]["config"]
+        self.assertEqual(self.models.calls[0]["model"], "gemini-3-flash-preview")
         self.assertEqual(
             config["tools"][0]["file_search"]["file_search_store_names"],
             ["fileSearchStores/patient-P0001"],
         )
         self.assertEqual(config["tools"][0]["file_search"]["top_k"], 7)
+        self.assertEqual(config["response_mime_type"], "application/json")
+        self.assertIn("status", config["response_json_schema"]["properties"])
+        self.assertIn("blocks", config["response_json_schema"]["properties"])
+        self.assertIn("used_source_ids", config["response_json_schema"]["properties"])
+        self.assertIn("show_sources", config["response_json_schema"]["properties"])
+        self.assertNotIn("style", str(config["response_json_schema"]))
         self.assertEqual(config["system_instruction"], "시스템 지시")
         self.assertEqual(config["temperature"], 0.2)
         self.assertEqual(config["max_output_tokens"], 1024)
-        self.assertEqual(config["thinking_config"].thinking_budget, 0)
+        self.assertEqual(config["thinking_config"].thinking_level.value, "MINIMAL")
 
     def test_generate_answer_logs_finish_reason_and_retrieval_metadata_without_chunk_text(self) -> None:
         self.models.next_response = SimpleNamespace(
@@ -771,19 +850,21 @@ class GoogleGeminiGatewayTest(unittest.TestCase):
 
         with self.assertLogs("app.services.gemini_qa", level="INFO") as logs:
             answer = self.gateway.generate_answer(
-                model="gemini-2.5-flash",
+                model="gemini-3-flash-preview",
                 system_instruction="시스템 지시",
                 prompt="질문",
                 file_search_store_name="fileSearchStores/patient-P0001",
+                response_json_schema=ModelAnswer.model_json_schema(),
                 temperature=0.2,
                 max_output_tokens=700,
-                thinking_budget=0,
+                thinking_level="minimal",
                 file_search_top_k=5,
                 log_retrieval=True,
             )
 
         log_output = "\n".join(logs.output)
-        self.assertEqual(answer, "답변")
+        self.assertEqual(answer.text, "답변")
+        self.assertEqual(answer.grounding_source_ids, ["result_20260421.pdf"])
         self.assertIn("finish_reason=MAX_TOKENS", log_output)
         self.assertIn("grounding_chunks=1", log_output)
         self.assertIn("document_name=fileSearchStores/patient-P0001/documents/result-new", log_output)

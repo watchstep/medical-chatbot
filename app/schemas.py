@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -49,69 +51,12 @@ class PatientIndex(BaseModel):
     patients: list[PatientIndexEntry]
 
 
-class PatientFileMeta(BaseModel):
-    type: str
-    date: str
-    filename: str
-    description: str | None = None
-    file_id: str | None = None
-
-    @model_validator(mode="after")
-    def normalize_date(self) -> "PatientFileMeta":
-        self.date = self.date.replace("-", "")
-        return self
-
-
-class LatestSummary(BaseModel):
-    date: str
-    title: str
-    description: str
-
-
-class PatientMeta(BaseModel):
-    patient_id: str
-    name: str
-    birth: str
-    latest_visit_date: str | None = None
-    files: list[PatientFileMeta]
-    latest_summary: LatestSummary | None = None
-    drive_folder_id: str | None = None
-    allowed_kakao_user_ids: list[str] = Field(default_factory=list)
-    created_at: str | None = None
-
-    @model_validator(mode="after")
-    def fill_derived_fields(self) -> "PatientMeta":
-        if self.latest_visit_date is not None:
-            self.latest_visit_date = self.latest_visit_date.replace("-", "")
-        elif self.files:
-            self.latest_visit_date = max(file.date for file in self.files)
-
-        if self.latest_summary is None and self.latest_visit_date is not None:
-            self.latest_summary = LatestSummary(
-                date=self.latest_visit_date,
-                title=(
-                    f"{self.latest_visit_date[:4]}년 {int(self.latest_visit_date[4:6])}월 "
-                    f"{int(self.latest_visit_date[6:8])}일 진료 및 검사 기록"
-                ),
-                description="최근 검사결과지와 진료기록부가 등록되어 있습니다.",
-            )
-
-        return self
-
-
 class DriveFile(BaseModel):
     file_id: str
     name: str
     mime_type: str
     date: str | None = None
     type: str | None = None
-
-
-class PatientRecordContext(BaseModel):
-    patient: PatientIndexEntry
-    meta: PatientMeta
-    latest_result: DriveFile | None
-    latest_chart: DriveFile | None
 
 
 class DocumentRegistryEntry(BaseModel):
@@ -144,3 +89,40 @@ class PatientDocumentRegistryContext(BaseModel):
     latest_result: DocumentRegistryEntry | None
     latest_chart: DocumentRegistryEntry | None
     file_search_store_name: str | None = None
+
+
+Status = Literal[
+    "ok",
+    "blocked",
+    "cannot_verify",
+    "emergency",
+    "out_of_scope",
+    "cost_block",
+    "full_doc_block",
+]
+BlockType = Literal["paragraph", "bullet_list"]
+
+
+class Block(BaseModel):
+    type: BlockType
+    text: str | None = None
+    items: list[str] | None = None
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "Block":
+        if self.type == "paragraph":
+            if not self.text or self.items is not None:
+                raise ValueError("paragraph block must contain only text")
+        if self.type == "bullet_list":
+            if self.text is not None or not self.items:
+                raise ValueError("bullet_list block must contain only items")
+        return self
+
+
+class ModelAnswer(BaseModel):
+    status: Status
+    blocks: list[Block] = Field(default_factory=list, max_length=3)
+    used_source_ids: list[str] = Field(default_factory=list)
+    show_sources: bool = True

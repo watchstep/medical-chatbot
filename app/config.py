@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -12,16 +13,14 @@ class Settings(BaseSettings):
     drive_system_folder_name: str = "_system"
     patient_index_file_name: str = "patient_index.json"
     document_registry_file_name: str = "document_registry.json"
-    meta_file_name: str = "meta.json"
     session_ttl_minutes: int = 1440
     patient_index_cache_ttl_seconds: int = 300
     document_registry_cache_ttl_seconds: int = 300
-    patient_record_cache_ttl_seconds: int = 600
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3-flash-preview"
     gemini_temperature: float = 0.1
-    gemini_max_output_tokens: int = 4096
-    gemini_thinking_budget: int = 0
+    gemini_max_output_tokens: int = 3072
+    gemini_thinking_level: Literal["minimal", "low", "medium", "high"] = "low"
     gemini_file_search_top_k: int = 10
     gemini_file_search_chunk_max_tokens: int = 512
     gemini_file_search_chunk_overlap_tokens: int = 100

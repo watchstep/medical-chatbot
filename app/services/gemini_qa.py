@@ -36,7 +36,7 @@ from app.prompts.gemini_qa import (
     build_gemini_qa_question_prompt,
     build_gemini_qa_system_instruction,
 )
-from app.schemas import DocumentRegistryEntry, PatientDocumentRegistryContext
+from app.schemas import DocumentRegistryEntry, ModelAnswer, PatientDocumentRegistryContext
 
 
 logger = logging.getLogger(__name__)
@@ -85,6 +85,18 @@ class FileSearchStoreDocument:
 
 
 @dataclass(frozen=True)
+class GeminiGenerateResult:
+    text: str
+    grounding_source_ids: list[str]
+
+
+@dataclass(frozen=True)
+class GeminiQaAnswer:
+    model_answer: ModelAnswer
+    grounding_source_ids: list[str]
+
+
+@dataclass(frozen=True)
 class GoogleDriveFileReference:
     file_id: str
     name: str
@@ -120,12 +132,13 @@ class GeminiGateway:
         system_instruction: str,
         prompt: str,
         file_search_store_name: str,
+        response_json_schema: dict[str, Any],
         temperature: float,
         max_output_tokens: int,
-        thinking_budget: int | None,
+        thinking_level: str,
         file_search_top_k: int,
         log_retrieval: bool,
-    ) -> str:
+    ) -> GeminiGenerateResult:
         raise NotImplementedError
 
 
@@ -135,6 +148,16 @@ def is_file_search_store_name(name: str) -> bool:
 
 def is_file_search_document_name(name: str) -> bool:
     return name.startswith(FILE_SEARCH_STORE_PREFIX) and FILE_SEARCH_DOCUMENT_SEGMENT in name
+
+
+def dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
 
 
 def extract_google_drive_id(file_id_or_url: str) -> str:
@@ -507,12 +530,13 @@ class GoogleGeminiGateway(GeminiGateway):
         system_instruction: str,
         prompt: str,
         file_search_store_name: str,
+        response_json_schema: dict[str, Any],
         temperature: float,
         max_output_tokens: int,
-        thinking_budget: int | None,
+        thinking_level: str,
         file_search_top_k: int,
         log_retrieval: bool,
-    ) -> str:
+    ) -> GeminiGenerateResult:
         try:
             logger.info(
                 "Gemini QA using File Search Store model=%s store=%s",
@@ -531,13 +555,13 @@ class GoogleGeminiGateway(GeminiGateway):
                             top_k=file_search_top_k,
                         )
                     ],
+                    response_mime_type="application/json",
+                    response_json_schema=response_json_schema,
                     temperature=temperature,
                     max_output_tokens=max_output_tokens,
                     thinking_config=types.ThinkingConfig(
-                        thinking_budget=thinking_budget,
-                    )
-                    if thinking_budget is not None
-                    else None,
+                        thinking_level=thinking_level,
+                    ),
                 ),
             )
         except Exception as exc:
@@ -550,7 +574,46 @@ class GoogleGeminiGateway(GeminiGateway):
         text = getattr(response, "text", "") or ""
         if not text:
             raise GeminiQaError("Gemini 응답이 비어 있습니다.")
-        return text
+        return GeminiGenerateResult(
+            text=text,
+            grounding_source_ids=self._extract_grounding_source_ids(response),
+        )
+
+    def _extract_grounding_source_ids(self, response: Any) -> list[str]:
+        candidates = self._object_get(response, "candidates", []) or []
+        candidate = candidates[0] if candidates else None
+        grounding_metadata = self._object_get(candidate, "grounding_metadata", None)
+        grounding_chunks = self._object_get(grounding_metadata, "grounding_chunks", []) or []
+        grounding_supports = self._object_get(grounding_metadata, "grounding_supports", []) or []
+
+        source_ids: list[str] = []
+        for support in grounding_supports:
+            chunk_indices = self._object_get(support, "grounding_chunk_indices", []) or []
+            for chunk_index in chunk_indices:
+                if not isinstance(chunk_index, int):
+                    continue
+                if chunk_index < 0 or chunk_index >= len(grounding_chunks):
+                    continue
+                source_id = self._extract_grounding_chunk_source_id(
+                    grounding_chunks[chunk_index]
+                )
+                if source_id:
+                    source_ids.append(source_id)
+        return dedupe_preserve_order(source_ids)
+
+    def _extract_grounding_chunk_source_id(self, chunk: Any) -> str:
+        retrieved_context = self._object_get(chunk, "retrieved_context", None)
+        custom_metadata = self._parse_custom_metadata(
+            self._object_get(retrieved_context, "custom_metadata", []) or []
+        )
+        filename = custom_metadata.get("filename", "")
+        if filename:
+            return filename
+        title = self._object_get(retrieved_context, "title", "") or ""
+        if title:
+            return str(title)
+        document_name = self._object_get(retrieved_context, "document_name", "") or ""
+        return str(document_name)
 
     def _log_generate_response_diagnostics(
         self,
@@ -1361,7 +1424,7 @@ class GeminiQaService:
         *,
         question: str,
         context: PatientDocumentRegistryContext,
-    ) -> str:
+    ) -> GeminiQaAnswer:
         logger.info("gemini_qa answer_question patient_id=%s", context.patient.patient_id)
         if not context.file_search_store_name:
             raise GeminiRecordNotFoundError("질의응답에 사용할 문서 저장소가 없습니다.")
@@ -1381,16 +1444,22 @@ class GeminiQaService:
             ]
         )
         try:
-            return self.gateway.generate_answer(
+            response_json_schema = ModelAnswer.model_json_schema()
+            generate_result = self.gateway.generate_answer(
                 model=self.settings.gemini_model,
                 system_instruction=system_instruction,
                 prompt=prompt,
                 file_search_store_name=context.file_search_store_name,
+                response_json_schema=response_json_schema,
                 temperature=self.settings.gemini_temperature,
                 max_output_tokens=self.settings.gemini_max_output_tokens,
-                thinking_budget=self.settings.gemini_thinking_budget,
+                thinking_level=self.settings.gemini_thinking_level,
                 file_search_top_k=self.settings.gemini_file_search_top_k,
                 log_retrieval=self.settings.gemini_file_search_log_retrieval,
+            )
+            return GeminiQaAnswer(
+                model_answer=self._parse_model_answer(generate_result.text),
+                grounding_source_ids=generate_result.grounding_source_ids,
             )
         except GeminiQaError:
             raise
@@ -1398,12 +1467,18 @@ class GeminiQaService:
             logger.exception("Gemini generate_answer failed")
             raise GeminiQaError("Gemini 답변 생성에 실패했습니다.") from exc
 
+    def _parse_model_answer(self, raw_answer: str) -> ModelAnswer:
+        try:
+            return ModelAnswer.model_validate_json(raw_answer)
+        except Exception as exc:
+            raise GeminiQaError("Gemini JSON 응답 schema 검증에 실패했습니다.") from exc
+
     def _build_document_descriptions(self, documents: list[DocumentRegistryEntry]) -> str:
         return "\n".join(
             (
-                f"- {document.filename} "
-                f"({self._document_type_label(document.document_type)}, "
-                f"문서 날짜: {document.document_date or '날짜 미상'})"
+                f"- source_id: {document.filename}, "
+                f"type: {self._document_type_label(document.document_type)}, "
+                f"document_date: {document.document_date or '날짜 미상'}"
             )
             for document in documents
         )

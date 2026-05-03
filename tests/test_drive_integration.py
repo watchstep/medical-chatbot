@@ -20,7 +20,7 @@ class GoogleDriveIntegrationTest(unittest.TestCase):
 
         self.assertGreater(len(patient_index.patients), 0)
 
-    def test_can_load_patient_record_context_from_real_google_drive(self) -> None:
+    def test_can_load_document_registry_for_real_google_drive(self) -> None:
         target_kakao_user_id = os.getenv("TEST_KAKAO_USER_ID")
         target_name = os.getenv("TEST_PATIENT_NAME")
         target_birth = os.getenv("TEST_PATIENT_BIRTH")
@@ -28,7 +28,7 @@ class GoogleDriveIntegrationTest(unittest.TestCase):
         if not all([target_name, target_birth]):
             self.skipTest(
                 "Set TEST_PATIENT_NAME and TEST_PATIENT_BIRTH "
-                "to verify a real patient folder lookup."
+                "to verify a real patient registry lookup."
             )
 
         settings = Settings()
@@ -49,7 +49,11 @@ class GoogleDriveIntegrationTest(unittest.TestCase):
             self.assertIsNotNone(mapped_patient)
             self.assertEqual(mapped_patient.patient_id, patient.patient_id)
 
-        context = service.get_patient_record_context(patient=patient)
+        registry = service.load_document_registry()
+        ready_documents = [
+            item
+            for item in registry.documents
+            if item.patient_id == patient.patient_id and item.sync_status == "READY"
+        ]
 
-        self.assertEqual(context.patient.patient_id, patient.patient_id)
-        self.assertIsNotNone(context.meta.latest_visit_date)
+        self.assertGreater(len(ready_documents), 0)

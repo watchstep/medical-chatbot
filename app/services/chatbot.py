@@ -5,7 +5,13 @@ import re
 
 from fastapi import BackgroundTasks
 
-from app.schemas import KakaoSkillRequest, PatientDocumentRegistryContext, PatientIndexEntry
+from app.schemas import (
+    DocumentRegistryEntry,
+    KakaoSkillRequest,
+    ModelAnswer,
+    PatientDocumentRegistryContext,
+    PatientIndexEntry,
+)
 from app.services.cache import PatientDataCacheService
 from app.services.drive import DriveLookupError
 from app.services.gemini_qa import GeminiQaError, GeminiQaService, GeminiRecordNotFoundError
@@ -56,9 +62,10 @@ AUTH_SUCCESS_MESSAGE = (
 )
 AUTHENTICATED_START_BLOCK_MESSAGE = (
     "{patient_name}님 안녕하세요.🙂\n"
-    "진단 기록 확인이 가능합니다.\n\n"
+    "진료 기록 확인이 가능합니다.\n\n"
     "아래 메뉴에서 [💾 최신 기록 조회]을 누르거나,\n"
     '채팅창에 "최신 기록 조회"라고 입력해 주세요.\n\n'
+    '진료 기록에 대해 궁금한 점이 있다면 아래 채팅창에 질문을 입력해 주세요.\n\n'
     '🤳다른 환자로 인증하려면 "인증 초기화"라고 입력해 주세요.'
 )
 INVALID_AUTH_FORMAT_MESSAGE = (
@@ -85,6 +92,48 @@ MAPPED_BUT_SESSION_EXPIRED_MESSAGE = (
 FREE_QUESTION_FAILURE_MESSAGE = (
     "현재 진단 기록 기반 답변을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요."
 )
+FORBIDDEN_ANSWER_TOKENS = [
+    ".pdf",
+    "source_id",
+    "fileSearchStores/",
+    "drive_file_id",
+    "chart_",
+    "result_",
+    "image_",
+]
+PRIVACY_KEYWORDS = [
+    "주민등록번호",
+    "생년월일",
+    "환자번호",
+    "등록번호",
+    "전화번호",
+    "휴대폰",
+    "이메일",
+    "주소",
+    "상세주소",
+    "우편번호",
+    "보호자명",
+    "계좌번호",
+    "카드번호",
+    "보험번호",
+]
+RESIDENT_REGISTRATION_RE = re.compile(r"\b\d{6}-\d{7}\b")
+PHONE_RE = re.compile(r"\b01[016789]-?\d{3,4}-?\d{4}\b|\b0\d{1,2}-\d{3,4}-\d{4}\b")
+EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+EIGHT_DIGIT_DATE_RE = re.compile(r"\b(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\b")
+DOCUMENT_TYPE_LABELS = {
+    "result": "검사결과지",
+    "chart": "진료기록부",
+    "image": "영상검사자료",
+}
+FIXED_STATUS_MESSAGES = {
+    "blocked": "⚠️ 개인정보 보호 정책에 따라 성함 이외의 세부 개인정보는 안내해 드리지 않습니다.",
+    "cannot_verify": "해당 내용은 제공된 진단 기록에서 확인하기 어렵습니다.",
+    "emergency": "⚠️ 즉시 의료기관을 방문하세요.",
+    "out_of_scope": "⚠️ 의료 기록과 관련된 질문에만 답변을 드릴 수 있습니다.",
+    "cost_block": "⚠️ 비용 관련 정보는 해당 의료기관에 직접 문의하셔야 합니다.",
+    "full_doc_block": "⚠️ 의료 보안 정책에 따라 문서 전문을 그대로 출력하는 것은 제한되며, 궁금하신 특정 항목에 대해 요약해 드릴 수 있습니다.",
+}
 NO_RECORD_MESSAGE = (
     "확인 가능한 최신 진단 기록이 없어 답변드리기 어렵습니다.\n"
     "병원에 기록 등록 여부를 확인해 주세요."
@@ -226,7 +275,8 @@ class ChatbotService:
             f"{latest_summary_title}\n"
             f"{latest_summary_description}\n\n"
             f"👉최신 검사결과지: {context.latest_result.filename if context.latest_result else '없음'}\n"
-            f"👉최신 진료기록부: {context.latest_chart.filename if context.latest_chart else '없음'}"
+            f"👉최신 진료기록부: {context.latest_chart.filename if context.latest_chart else '없음'}\n\n"
+            "진료 기록에 대해 궁금한 점이 있다면 아래 채팅창에 질문을 입력해 주세요."
         )
 
     def _handle_free_question(
@@ -295,14 +345,125 @@ class ChatbotService:
         if self.gemini_qa_service is None:
             return FREE_QUESTION_FAILURE_MESSAGE
         try:
-            return self.gemini_qa_service.answer_question(
+            qa_answer = self.gemini_qa_service.answer_question(
                 question=question,
+                context=context,
+            )
+            return self._validate_and_render_model_answer(
+                model_answer=qa_answer.model_answer,
+                grounding_source_ids=qa_answer.grounding_source_ids,
                 context=context,
             )
         except GeminiRecordNotFoundError:
             return NO_RECORD_MESSAGE
         except (GeminiQaError, DriveLookupError):
             return FREE_QUESTION_FAILURE_MESSAGE
+
+    def _validate_and_render_model_answer(
+        self,
+        *,
+        model_answer: ModelAnswer,
+        grounding_source_ids: list[str],
+        context: PatientDocumentRegistryContext,
+    ) -> str:
+        if model_answer.status != "ok":
+            return FIXED_STATUS_MESSAGES[model_answer.status]
+
+        if self._answer_contains_private_info(model_answer):
+            return FIXED_STATUS_MESSAGES["blocked"]
+        if self._answer_contains_forbidden_token(model_answer):
+            return FIXED_STATUS_MESSAGES["cannot_verify"]
+
+        final_sources = self._validate_final_sources(
+            model_answer=model_answer,
+            grounding_source_ids=grounding_source_ids,
+            context=context,
+        )
+        if not final_sources:
+            return FIXED_STATUS_MESSAGES["cannot_verify"]
+
+        return self._render_model_answer_body(
+            model_answer=model_answer,
+            sources=final_sources,
+        )
+
+    def _validate_final_sources(
+        self,
+        *,
+        model_answer: ModelAnswer,
+        grounding_source_ids: list[str],
+        context: PatientDocumentRegistryContext,
+    ) -> list[DocumentRegistryEntry]:
+        del grounding_source_ids
+
+        ready_documents = [
+            item for item in context.documents if item.sync_status == "READY"
+        ]
+        ready_by_filename = {item.filename: item for item in ready_documents}
+        model_sources = dedupe_preserve_order(model_answer.used_source_ids)
+        if not model_sources:
+            return []
+        if any(source_id not in ready_by_filename for source_id in model_sources):
+            return []
+
+        return [ready_by_filename[source_id] for source_id in model_sources]
+
+    def _answer_contains_forbidden_token(self, model_answer: ModelAnswer) -> bool:
+        return any(
+            token in text
+            for text in self._iter_model_answer_text(model_answer)
+            for token in FORBIDDEN_ANSWER_TOKENS
+        )
+
+    def _answer_contains_private_info(self, model_answer: ModelAnswer) -> bool:
+        for text in self._iter_model_answer_text(model_answer):
+            if any(keyword in text for keyword in PRIVACY_KEYWORDS):
+                return True
+            if RESIDENT_REGISTRATION_RE.search(text):
+                return True
+            if PHONE_RE.search(text):
+                return True
+            if EMAIL_RE.search(text):
+                return True
+            if EIGHT_DIGIT_DATE_RE.search(text):
+                return True
+        return False
+
+    def _iter_model_answer_text(self, model_answer: ModelAnswer) -> list[str]:
+        texts: list[str] = []
+        for block in model_answer.blocks:
+            if block.type == "paragraph" and block.text:
+                texts.append(block.text)
+            if block.type == "bullet_list" and block.items:
+                texts.extend(block.items)
+        return texts
+
+    def _render_model_answer_body(
+        self,
+        *,
+        model_answer: ModelAnswer,
+        sources: list[DocumentRegistryEntry],
+    ) -> str:
+        rendered_blocks: list[str] = []
+        for block in model_answer.blocks:
+            if block.type == "paragraph" and block.text:
+                rendered_blocks.append(block.text)
+                continue
+            if block.type == "bullet_list" and block.items:
+                rendered_blocks.append("\n".join(f"- {item}" for item in block.items))
+
+        if not rendered_blocks:
+            return FIXED_STATUS_MESSAGES["cannot_verify"]
+        source_lines = [
+            f"{index}. {self._document_type_label(source.document_type)}, "
+            f"{self._format_document_date(source.document_date)} ({source.filename})"
+            for index, source in enumerate(sources, start=1)
+        ]
+        if not source_lines:
+            return FIXED_STATUS_MESSAGES["cannot_verify"]
+
+        source_header = f"📄 출처 ({len(source_lines)}건)"
+        return "\n\n".join(rendered_blocks + [source_header + "\n" + "\n".join(source_lines)])
 
     def _handle_auth(
         self,
@@ -413,3 +574,24 @@ class ChatbotService:
         if has_chart:
             return "최근 진료기록부가 등록되어 있습니다."
         return "최근 진료 기록이 등록되어 있습니다."
+
+    def _document_type_label(self, document_type: str) -> str:
+        return DOCUMENT_TYPE_LABELS.get(document_type, document_type or "문서")
+
+    def _format_document_date(self, document_date: str) -> str:
+        if len(document_date) != 8 or not document_date.isdigit():
+            return "날짜 미상"
+        return (
+            f"{document_date[:4]}년 {int(document_date[4:6])}월 "
+            f"{int(document_date[6:8])}일"
+        )
+
+
+def dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
