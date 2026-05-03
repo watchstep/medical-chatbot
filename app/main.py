@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 from fastapi import BackgroundTasks, FastAPI, Request
 
@@ -13,7 +14,9 @@ from app.services.gemini_qa import GeminiQaService, build_default_gemini_qa_serv
 from app.services.kakao_callback import KakaoCallbackService
 from app.sessions import InMemorySessionStore
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+)
 logger = logging.getLogger(__name__)
 
 

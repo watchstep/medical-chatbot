@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     gemini_temperature: float = 0.1
     gemini_max_output_tokens: int = 3072
     gemini_thinking_level: Literal["minimal", "low", "medium", "high"] = "low"
-    gemini_file_search_top_k: int = 10
+    gemini_file_search_top_k: int = 8
     gemini_file_search_chunk_max_tokens: int = 512
     gemini_file_search_chunk_overlap_tokens: int = 100
     gemini_file_search_log_retrieval: bool = True
