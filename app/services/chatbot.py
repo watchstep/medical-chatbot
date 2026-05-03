@@ -100,6 +100,7 @@ FORBIDDEN_ANSWER_TOKENS = [
     "chart_",
     "result_",
     "image_",
+    "📄 출처",
 ]
 PRIVACY_KEYWORDS = [
     "주민등록번호",
@@ -127,12 +128,12 @@ DOCUMENT_TYPE_LABELS = {
     "image": "영상검사자료",
 }
 FIXED_STATUS_MESSAGES = {
-    "blocked": "⚠️ 개인정보 보호 정책에 따라 성함 이외의 세부 개인정보는 안내해 드리지 않습니다.",
-    "cannot_verify": "해당 내용은 제공된 진단 기록에서 확인하기 어렵습니다.",
-    "emergency": "⚠️ 즉시 의료기관을 방문하세요.",
-    "out_of_scope": "⚠️ 의료 기록과 관련된 질문에만 답변을 드릴 수 있습니다.",
-    "cost_block": "⚠️ 비용 관련 정보는 해당 의료기관에 직접 문의하셔야 합니다.",
-    "full_doc_block": "⚠️ 의료 보안 정책에 따라 문서 전문을 그대로 출력하는 것은 제한되며, 궁금하신 특정 항목에 대해 요약해 드릴 수 있습니다.",
+    "emergency": "🚨 즉시 의료기관을 방문하시길 바랍니다.",
+    "blocked": "🔒 개인정보 보호 정책에 따라 성함 이외의 세부 개인정보는 안내해 드리지 않습니다.",
+    "full_doc_block": "📑 의료 보안 정책에 따라 문서 전문 출력이 제한되며, 궁금하신 특정 항목에 대해 요약해 드릴 수 있습니다.",
+    "cost_block": "💳 비용 관련 정보는 해당 의료기관에 직접 문의하셔야 합니다.",
+    "out_of_scope": "💬 의료 기록과 관련된 질문에만 답변을 드릴 수 있습니다.",
+    "cannot_verify": "🔍 해당 내용은 제공된 진단 기록에서 확인하기 어렵습니다.",
 }
 NO_RECORD_MESSAGE = (
     "확인 가능한 최신 진단 기록이 없어 답변드리기 어렵습니다.\n"
@@ -351,7 +352,6 @@ class ChatbotService:
             )
             return self._validate_and_render_model_answer(
                 model_answer=qa_answer.model_answer,
-                grounding_source_ids=qa_answer.grounding_source_ids,
                 context=context,
             )
         except GeminiRecordNotFoundError:
@@ -363,26 +363,39 @@ class ChatbotService:
         self,
         *,
         model_answer: ModelAnswer,
-        grounding_source_ids: list[str],
         context: PatientDocumentRegistryContext,
     ) -> str:
+        """Validate structure/safety and assemble the final Kakao message.
+
+        The backend does not reinterpret the user's question or semantically
+        reclassify the model-provided status. It only decides whether the model
+        response is safe/usable and appends a backend-generated source section
+        for ok responses.
+        """
         if model_answer.status != "ok":
             return FIXED_STATUS_MESSAGES[model_answer.status]
 
-        if self._answer_contains_private_info(model_answer):
-            return FIXED_STATUS_MESSAGES["blocked"]
+        if not model_answer.evidence.strip():
+            logger.warning("model answer rejected: empty evidence")
+            return FIXED_STATUS_MESSAGES["cannot_verify"]
+
+        if not model_answer.kakaotalk_render.strip():
+            logger.warning("model answer rejected: empty kakaotalk_render")
+            return FIXED_STATUS_MESSAGES["cannot_verify"]
+
         if self._answer_contains_forbidden_token(model_answer):
+            logger.warning("model answer rejected: forbidden token in kakaotalk_render")
             return FIXED_STATUS_MESSAGES["cannot_verify"]
 
         final_sources = self._validate_final_sources(
             model_answer=model_answer,
-            grounding_source_ids=grounding_source_ids,
             context=context,
         )
         if not final_sources:
+            logger.warning("model answer rejected: no valid READY source")
             return FIXED_STATUS_MESSAGES["cannot_verify"]
 
-        return self._render_model_answer_body(
+        return self._build_final_kakao_message(
             model_answer=model_answer,
             sources=final_sources,
         )
@@ -391,11 +404,8 @@ class ChatbotService:
         self,
         *,
         model_answer: ModelAnswer,
-        grounding_source_ids: list[str],
         context: PatientDocumentRegistryContext,
     ) -> list[DocumentRegistryEntry]:
-        del grounding_source_ids
-
         ready_documents = [
             item for item in context.documents if item.sync_status == "READY"
         ]
@@ -403,67 +413,47 @@ class ChatbotService:
         model_sources = dedupe_preserve_order(model_answer.used_source_ids)
         if not model_sources:
             return []
-        if any(source_id not in ready_by_filename for source_id in model_sources):
-            return []
 
-        return [ready_by_filename[source_id] for source_id in model_sources]
+        return [
+            ready_by_filename[source_id]
+            for source_id in model_sources
+            if source_id in ready_by_filename
+        ]
 
     def _answer_contains_forbidden_token(self, model_answer: ModelAnswer) -> bool:
         return any(
-            token in text
-            for text in self._iter_model_answer_text(model_answer)
+            token in model_answer.kakaotalk_render
             for token in FORBIDDEN_ANSWER_TOKENS
         )
 
-    def _answer_contains_private_info(self, model_answer: ModelAnswer) -> bool:
-        for text in self._iter_model_answer_text(model_answer):
-            if any(keyword in text for keyword in PRIVACY_KEYWORDS):
-                return True
-            if RESIDENT_REGISTRATION_RE.search(text):
-                return True
-            if PHONE_RE.search(text):
-                return True
-            if EMAIL_RE.search(text):
-                return True
-            if EIGHT_DIGIT_DATE_RE.search(text):
-                return True
-        return False
-
-    def _iter_model_answer_text(self, model_answer: ModelAnswer) -> list[str]:
-        texts: list[str] = []
-        for block in model_answer.blocks:
-            if block.type == "paragraph" and block.text:
-                texts.append(block.text)
-            if block.type == "bullet_list" and block.items:
-                texts.extend(block.items)
-        return texts
-
-    def _render_model_answer_body(
+    def _build_final_kakao_message(
         self,
         *,
         model_answer: ModelAnswer,
         sources: list[DocumentRegistryEntry],
     ) -> str:
-        rendered_blocks: list[str] = []
-        for block in model_answer.blocks:
-            if block.type == "paragraph" and block.text:
-                rendered_blocks.append(block.text)
-                continue
-            if block.type == "bullet_list" and block.items:
-                rendered_blocks.append("\n".join(f"- {item}" for item in block.items))
+        body = model_answer.kakaotalk_render.strip()
+        source_section = self._render_source_section(sources)
+        if not source_section:
+            return FIXED_STATUS_MESSAGES["cannot_verify"]
+        return f"{body}\n\n{source_section}"
 
-        if not rendered_blocks:
-            return FIXED_STATUS_MESSAGES["cannot_verify"]
-        source_lines = [
-            f"{index}. {self._document_type_label(source.document_type)}, "
-            f"{self._format_document_date(source.document_date)} ({source.filename})"
-            for index, source in enumerate(sources, start=1)
-        ]
+    def _render_source_section(self, sources: list[DocumentRegistryEntry]) -> str:
+        source_lines = []
+        for index, source in enumerate(sources, start=1):
+            line = (
+                f"{index}. {self._document_type_label(source.document_type)}, "
+                f"{self._format_document_date(source.document_date)}"
+            )
+            if source.filename:
+                line += f" ({source.filename})"
+            source_lines.append(line)
+
         if not source_lines:
-            return FIXED_STATUS_MESSAGES["cannot_verify"]
+            return ""
 
         source_header = f"📄 출처 ({len(source_lines)}건)"
-        return "\n\n".join(rendered_blocks + [source_header + "\n" + "\n".join(source_lines)])
+        return source_header + "\n" + "\n".join(source_lines)
 
     def _handle_auth(
         self,

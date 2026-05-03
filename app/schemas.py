@@ -100,29 +100,11 @@ Status = Literal[
     "cost_block",
     "full_doc_block",
 ]
-BlockType = Literal["paragraph", "bullet_list"]
-
-
-class Block(BaseModel):
-    type: BlockType
-    text: str | None = None
-    items: list[str] | None = None
-
-    model_config = {"extra": "forbid"}
-
-    @model_validator(mode="after")
-    def validate_shape(self) -> "Block":
-        if self.type == "paragraph":
-            if not self.text or self.items is not None:
-                raise ValueError("paragraph block must contain only text")
-        if self.type == "bullet_list":
-            if self.text is not None or not self.items:
-                raise ValueError("bullet_list block must contain only items")
-        return self
-
 
 class ModelAnswer(BaseModel):
+    evidence: str = ""
     status: Status
-    blocks: list[Block] = Field(default_factory=list, max_length=3)
+    kakaotalk_render: str = ""
     used_source_ids: list[str] = Field(default_factory=list)
-    show_sources: bool = True
+
+    model_config = {"extra": "forbid"}
