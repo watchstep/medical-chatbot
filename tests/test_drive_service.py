@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import sentinel, patch
 
 from app.config import Settings
 from app.schemas import DriveFile
-from app.services.drive import DriveLookupError, DriveLookupService
+from app.services.drive import (
+    GoogleDriveGateway,
+    DriveLookupError,
+    DriveLookupService,
+    build_default_drive_service,
+)
 
 
 class FakeDriveGateway:
@@ -169,6 +175,91 @@ class LegacyFakeDriveGateway(FakeDriveGateway):
           ]
         }
         """
+
+
+class GoogleDriveGatewayAuthTest(unittest.TestCase):
+    def test_uses_adc_when_credentials_path_is_not_configured(self) -> None:
+        with patch(
+            "app.services.drive.google.auth.default",
+            return_value=(sentinel.credentials, sentinel.project_id),
+        ) as default_auth, patch(
+            "app.services.drive.build",
+            return_value=sentinel.service,
+        ) as build:
+            gateway = GoogleDriveGateway()
+
+        default_auth.assert_called_once_with(
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        build.assert_called_once_with(
+            "drive",
+            "v3",
+            credentials=sentinel.credentials,
+            cache_discovery=False,
+        )
+        self.assertIs(gateway.service, sentinel.service)
+
+    def test_uses_service_account_file_when_credentials_path_is_configured(self) -> None:
+        with patch(
+            "app.services.drive.ServiceAccountCredentials.from_service_account_file",
+            return_value=sentinel.credentials,
+        ) as from_service_account_file, patch(
+            "app.services.drive.build",
+            return_value=sentinel.service,
+        ) as build:
+            gateway = GoogleDriveGateway("credentials/google-service-account.json")
+
+        from_service_account_file.assert_called_once_with(
+            "credentials/google-service-account.json",
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        build.assert_called_once_with(
+            "drive",
+            "v3",
+            credentials=sentinel.credentials,
+            cache_discovery=False,
+        )
+        self.assertIs(gateway.service, sentinel.service)
+
+
+class BuildDefaultDriveServiceTest(unittest.TestCase):
+    def test_empty_credentials_path_uses_adc(self) -> None:
+        settings = Settings(google_service_account_path="")
+
+        with patch(
+            "app.services.drive.GoogleDriveGateway",
+            return_value=FakeDriveGateway(),
+        ) as gateway_class:
+            service = build_default_drive_service(settings)
+
+        gateway_class.assert_called_once_with(None)
+        self.assertIsInstance(service, DriveLookupService)
+
+    def test_uses_adc_when_credentials_path_is_not_configured(self) -> None:
+        settings = Settings()
+
+        with patch(
+            "app.services.drive.GoogleDriveGateway",
+            return_value=FakeDriveGateway(),
+        ) as gateway_class:
+            service = build_default_drive_service(settings)
+
+        gateway_class.assert_called_once_with(None)
+        self.assertIsInstance(service, DriveLookupService)
+
+    def test_uses_service_account_file_when_credentials_path_is_configured(self) -> None:
+        settings = Settings(
+            google_service_account_path="credentials/google-service-account.json",
+        )
+
+        with patch(
+            "app.services.drive.GoogleDriveGateway",
+            return_value=FakeDriveGateway(),
+        ) as gateway_class:
+            service = build_default_drive_service(settings)
+
+        gateway_class.assert_called_once_with("credentials/google-service-account.json")
+        self.assertIsInstance(service, DriveLookupService)
 
 
 class DriveLookupServiceTest(unittest.TestCase):

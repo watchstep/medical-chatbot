@@ -21,7 +21,8 @@ https://{ngrok-domain}/kakao/chat
 
 ## Required Setup
 
-- `credentials/google-service-account.json`이 존재해야 합니다.
+- Cloud Run에서는 배포된 런타임 서비스 계정에 Google Drive 폴더 접근 권한을 공유해야 합니다.
+- 로컬에서 서비스 계정 JSON 파일을 직접 쓰려면 `.env`에 `GOOGLE_SERVICE_ACCOUNT_PATH=credentials/google-service-account.json`를 설정합니다. 미설정 시 Application Default Credentials를 사용합니다.
 - `.env` 또는 실행 환경에 `GEMINI_API_KEY`를 설정해야 Gemini File Search Store 기반 질의응답이 동작합니다.
 - 카카오 AI 챗봇 callback 기능을 사용할 수 있어야 자유 질문이 5초 제한 안에서 동작합니다.
 - Google Drive에 `medical-chatbot/_system/patient_index.json`이 있어야 합니다.
@@ -57,6 +58,26 @@ python -m app.tools.sync_document_registry
 ```bash
 python -m app.tools.sync_document_registry --apply
 ```
+
+## Markdown Parsing PoC
+
+Firestore 전환 전에 Google Drive 원본 PDF를 Gemini로 직접 파싱해 `parsed.md` 품질을 확인할 수 있습니다.
+
+```bash
+python -m app.tools.parse_drive_document \
+  --drive-file-id {google-drive-file-id-or-url} \
+  --out artifacts/parsing/{google-drive-file-id}/parsed.md
+```
+
+`--out`을 생략하면 `artifacts/parsing/{drive_file_id}/parsed.md`에 저장됩니다. 출력 요약에는 글자 수, Markdown table 행 수, 페이지 마커 수가 포함됩니다.
+
+```bash
+python -m app.tools.parse_drive_document \
+  --drive-file-id {google-drive-file-id-or-url} \
+  --json
+```
+
+파싱 결과는 의료 원문을 포함할 수 있으므로 `artifacts/`는 git에 포함하지 않습니다.
 
 ## Sync All
 

@@ -544,7 +544,6 @@ class GoogleGeminiGateway(GeminiGateway):
                 file_search_store_name,
             )
 
-            api_start = time.perf_counter()
             response = self.client.models.generate_content(
                 model=model,
                 contents=prompt,
@@ -564,14 +563,6 @@ class GoogleGeminiGateway(GeminiGateway):
                         thinking_level=thinking_level,
                     ),
                 ),
-            )
-            logger.debug(
-                "Gemini generate_content API finished model=%s store=%s top_k=%s max_output_tokens=%s elapsed=%.2fs",
-                model,
-                file_search_store_name,
-                file_search_top_k,
-                max_output_tokens,
-                time.perf_counter() - api_start,
             )
         except Exception as exc:
             raise GeminiQaError("Gemini 답변 생성에 실패했습니다.") from exc
@@ -1434,8 +1425,7 @@ class GeminiQaService:
         question: str,
         context: PatientDocumentRegistryContext,
     ) -> GeminiQaAnswer:
-        total_start = time.perf_counter()
-        logger.info("gemini_qa answer_question start patient_id=%s", context.patient.patient_id)
+        logger.info("gemini_qa answer_question patient_id=%s", context.patient.patient_id)
         if not context.file_search_store_name:
             raise GeminiRecordNotFoundError("질의응답에 사용할 문서 저장소가 없습니다.")
 
@@ -1443,7 +1433,6 @@ class GeminiQaService:
         if not ready_documents:
             raise GeminiRecordNotFoundError("질의응답에 사용할 진단기록 PDF가 없습니다.")
 
-        build_prompt_start = time.perf_counter()
         document_descriptions = self._build_document_descriptions(ready_documents)
         system_instruction = build_gemini_qa_system_instruction(
             document_descriptions=document_descriptions,
@@ -1454,16 +1443,8 @@ class GeminiQaService:
                 build_gemini_qa_question_prompt(question=question),
             ]
         )
-        response_json_schema = ModelAnswer.model_json_schema()
-        logger.debug(
-            "gemini_qa prompt built patient_id=%s ready_documents=%s elapsed=%.2fs",
-            context.patient.patient_id,
-            len(ready_documents),
-            time.perf_counter() - build_prompt_start,
-        )
-
         try:
-            generate_start = time.perf_counter()
+            response_json_schema = ModelAnswer.model_json_schema()
             generate_result = self.gateway.generate_answer(
                 model=self.settings.gemini_model,
                 system_instruction=system_instruction,
@@ -1476,37 +1457,14 @@ class GeminiQaService:
                 file_search_top_k=self.settings.gemini_file_search_top_k,
                 log_retrieval=self.settings.gemini_file_search_log_retrieval,
             )
-            logger.debug(
-                "gemini_qa generate finished patient_id=%s model=%s top_k=%s max_output_tokens=%s elapsed=%.2fs",
-                context.patient.patient_id,
-                self.settings.gemini_model,
-                self.settings.gemini_file_search_top_k,
-                self.settings.gemini_max_output_tokens,
-                time.perf_counter() - generate_start,
-            )
-
-            parse_start = time.perf_counter()
-            model_answer = self._parse_model_answer(generate_result.text)
-            logger.debug(
-                "gemini_qa parse finished patient_id=%s status=%s used_sources=%s elapsed=%.2fs total_elapsed=%.2fs",
-                context.patient.patient_id,
-                model_answer.status,
-                len(model_answer.used_source_ids),
-                time.perf_counter() - parse_start,
-                time.perf_counter() - total_start,
-            )
             return GeminiQaAnswer(
-                model_answer=model_answer,
+                model_answer=self._parse_model_answer(generate_result.text),
                 grounding_source_ids=generate_result.grounding_source_ids,
             )
         except GeminiQaError:
             raise
         except Exception as exc:
-            logger.exception(
-                "Gemini generate_answer failed patient_id=%s elapsed=%.2fs",
-                context.patient.patient_id,
-                time.perf_counter() - total_start,
-            )
+            logger.exception("Gemini generate_answer failed")
             raise GeminiQaError("Gemini 답변 생성에 실패했습니다.") from exc
 
     def _parse_model_answer(self, raw_answer: str) -> ModelAnswer:

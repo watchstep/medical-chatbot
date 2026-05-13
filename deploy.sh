@@ -17,16 +17,21 @@ gcloud run deploy "$SERVICE_NAME" \
   --timeout 300 \
   --memory 1Gi \
   --cpu 1 \
-  --set-env-vars GOOGLE_SERVICE_ACCOUNT_PATH=/credentials/google-service-account.json \
+  --min-instances 1 \
   --set-env-vars DRIVE_ROOT_FOLDER_NAME=medical-chatbot \
   --set-env-vars DRIVE_SYSTEM_FOLDER_NAME=_system \
   --set-env-vars PATIENT_INDEX_FILE_NAME=patient_index.json \
   --set-env-vars DOCUMENT_REGISTRY_FILE_NAME=document_registry.json \
   --set-env-vars GEMINI_MODEL=gemini-3-flash-preview \
+  --set-env-vars GEMINI_PARSING_MODEL=gemini-3-flash-preview \
   --set-env-vars GEMINI_TEMPERATURE=0.1 \
   --set-env-vars GEMINI_MAX_OUTPUT_TOKENS=2048 \
+  --set-env-vars GEMINI_PARSING_MAX_OUTPUT_TOKENS=32768 \
+  --set-env-vars GEMINI_PARSING_TEMPERATURE=0.0 \
+  --set-env-vars GEMINI_PARSING_TOP_K=1 \
+  --set-env-vars GEMINI_PARSING_THINKING_LEVEL=minimal \
   --set-env-vars GEMINI_FILE_SEARCH_TOP_K=7 \
   --set-env-vars GEMINI_THINKING_LEVEL=low \
   --set-env-vars GEMINI_FILE_SEARCH_LOG_RETRIEVAL=false \
-  --set-env-vars LOG_LEVEL=INFO\
-  --set-secrets GEMINI_API_KEY=gemini-api-key:latest,/credentials/google-service-account.json=google-service-account-json:latest
+  --set-env-vars LOG_LEVEL=INFO \
+  --set-secrets GEMINI_API_KEY=gemini-api-key:latest

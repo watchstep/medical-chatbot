@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import re
-import time
 
 from fastapi import BackgroundTasks
 
@@ -34,19 +33,6 @@ AUTH_RESET_COMMANDS = {
 }
 BIRTH_RE = re.compile(r"^\d{8}$")
 LATEST_RECORD_INTENTS = {
-    "기록",
-    "진단기록",
-    "진료기록",
-    "진단 기록",
-    "진료기록",
-    "진단 기록 조회",
-    "진료 기록 조회",
-    "검사 기록",
-    "검사기록"
-    "기록 조회",
-    "기록조회",
-    "진단기록 조회",
-    "진료기록 조회",
     "최신기록",
     "최신 기록",
     "최신 기록 조회",
@@ -319,19 +305,11 @@ class ChatbotService:
         question: str,
         callback_url: str,
     ) -> None:
-        total_start = time.perf_counter()
-        logger.debug("free_question_callback start patient_id=%s", patient.patient_id)
+        logger.info("free_question_callback start patient_id=%s", patient.patient_id)
         try:
-            context_start = time.perf_counter()
             context = self.patient_data_cache_service.get_patient_document_context(
                 patient=patient,
             )
-            logger.debug(
-                "free_question_callback context loaded patient_id=%s elapsed=%.2fs",
-                patient.patient_id,
-                time.perf_counter() - context_start,
-            )
-
             if not self._has_ready_documents(context):
                 answer = (
                     RECORD_PREPARING_MESSAGE
@@ -339,50 +317,25 @@ class ChatbotService:
                     else NO_RECORD_MESSAGE
                 )
             else:
-                answer_start = time.perf_counter()
                 answer = self._generate_free_question_answer(
                     question=question,
                     context=context,
                 )
-                logger.debug(
-                    "free_question_callback answer generated patient_id=%s elapsed=%.2fs",
-                    patient.patient_id,
-                    time.perf_counter() - answer_start,
-                )
         except DriveLookupError as exc:
-            logger.warning(
-                "free_question_callback document lookup failure patient_id=%s elapsed=%.2fs error=%s",
-                patient.patient_id,
-                time.perf_counter() - total_start,
-                str(exc),
-            )
+            logger.warning("free_question_callback document lookup failure: %s", str(exc))
             answer = FREE_QUESTION_FAILURE_MESSAGE
         except Exception:
-            logger.exception(
-                "free_question_callback unexpected failure patient_id=%s elapsed=%.2fs",
-                patient.patient_id,
-                time.perf_counter() - total_start,
-            )
+            logger.exception("free_question_callback unexpected failure")
             answer = FREE_QUESTION_FAILURE_MESSAGE
 
         try:
-            send_start = time.perf_counter()
             self.kakao_callback_service.send_text_response(
                 callback_url=callback_url,
                 text=answer,
             )
-            logger.debug(
-                "free_question_callback send success patient_id=%s elapsed=%.2fs total_elapsed=%.2fs",
-                patient.patient_id,
-                time.perf_counter() - send_start,
-                time.perf_counter() - total_start,
-            )
+            logger.info("free_question_callback success patient_id=%s", patient.patient_id)
         except Exception:
-            logger.exception(
-                "free_question_callback send failure patient_id=%s total_elapsed=%.2fs",
-                patient.patient_id,
-                time.perf_counter() - total_start,
-            )
+            logger.exception("free_question_callback send failure")
 
     def _generate_free_question_answer(
         self,
@@ -392,53 +345,18 @@ class ChatbotService:
     ) -> str:
         if self.gemini_qa_service is None:
             return FREE_QUESTION_FAILURE_MESSAGE
-
-        total_start = time.perf_counter()
         try:
-            ready_document_count = sum(1 for item in context.documents if item.sync_status == "READY")
-            logger.info(
-                "free_question_answer start patient_id=%s ready_documents=%s",
-                context.patient.patient_id,
-                ready_document_count,
-            )
-
-            gemini_start = time.perf_counter()
             qa_answer = self.gemini_qa_service.answer_question(
                 question=question,
                 context=context,
             )
-            logger.debug(
-                "free_question_answer gemini finished patient_id=%s status=%s elapsed=%.2fs",
-                context.patient.patient_id,
-                qa_answer.model_answer.status,
-                time.perf_counter() - gemini_start,
-            )
-
-            render_start = time.perf_counter()
-            final_answer = self._validate_and_render_model_answer(
+            return self._validate_and_render_model_answer(
                 model_answer=qa_answer.model_answer,
                 context=context,
             )
-            logger.debug(
-                "free_question_answer render finished patient_id=%s elapsed=%.2fs total_elapsed=%.2fs",
-                context.patient.patient_id,
-                time.perf_counter() - render_start,
-                time.perf_counter() - total_start,
-            )
-            return final_answer
         except GeminiRecordNotFoundError:
-            logger.warning(
-                "free_question_answer no record patient_id=%s elapsed=%.2fs",
-                context.patient.patient_id,
-                time.perf_counter() - total_start,
-            )
             return NO_RECORD_MESSAGE
         except (GeminiQaError, DriveLookupError):
-            logger.exception(
-                "free_question_answer failure patient_id=%s elapsed=%.2fs",
-                context.patient.patient_id,
-                time.perf_counter() - total_start,
-            )
             return FREE_QUESTION_FAILURE_MESSAGE
 
     def _validate_and_render_model_answer(

@@ -6,7 +6,8 @@ import logging
 import re
 from dataclasses import asdict, dataclass
 
-from google.oauth2.service_account import Credentials
+import google.auth
+from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
@@ -24,6 +25,7 @@ from app.schemas import (
 FOLDER_MIME = "application/vnd.google-apps.folder"
 PATIENT_FOLDER_RE = re.compile(r"^(?P<patient_id>[^_]+)_(?P<name>.+)_(?P<birth>\d{8})$")
 logger = logging.getLogger(__name__)
+GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 
 
 class DriveLookupError(Exception):
@@ -94,12 +96,15 @@ class DriveGateway:
 
 
 class GoogleDriveGateway(DriveGateway):
-    def __init__(self, credentials_path: str):
-        scopes = ["https://www.googleapis.com/auth/drive"]
-        credentials = Credentials.from_service_account_file(
-            credentials_path,
-            scopes=scopes,
-        )
+    def __init__(self, credentials_path: str | None = None):
+        scopes = [GOOGLE_DRIVE_SCOPE]
+        if credentials_path:
+            credentials = ServiceAccountCredentials.from_service_account_file(
+                credentials_path,
+                scopes=scopes,
+            )
+        else:
+            credentials, _ = google.auth.default(scopes=scopes)
         self.service = build("drive", "v3", credentials=credentials, cache_discovery=False)
 
     def list_files(self, query: str) -> list[dict]:
@@ -251,9 +256,14 @@ class DriveLookupService:
         name: str | None = None,
         birth: str | None = None,
     ) -> dict:
+        auth_mode = (
+            "service_account_file"
+            if self.settings.google_service_account_path
+            else "adc"
+        )
         result: dict[str, object] = {
             "root_folder_name": self.settings.drive_root_folder_name,
-            "credentials_path": str(self.settings.google_service_account_path),
+            "auth_mode": auth_mode,
         }
 
         try:
@@ -762,7 +772,12 @@ class DriveLookupService:
 
 
 def build_default_drive_service(settings: Settings) -> DriveLookupService:
+    credentials_path = (
+        str(settings.google_service_account_path)
+        if settings.google_service_account_path
+        else None
+    )
     return DriveLookupService(
         settings=settings,
-        gateway=GoogleDriveGateway(str(settings.google_service_account_path)),
+        gateway=GoogleDriveGateway(credentials_path),
     )
