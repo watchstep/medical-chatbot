@@ -119,7 +119,7 @@ class DocumentParsingGateway:
 
 
 class GoogleGeminiDocumentParsingGateway(DocumentParsingGateway):
-    def __init__(self, api_key: str, *, client: Any | None = None):
+    def __init__(self, api_key: str, *, client: Any | None = None, timeout_ms: int | None = None):
         normalized_api_key = (api_key or "").strip().strip('"').strip("'")
         if not normalized_api_key:
             raise DocumentParsingError("Gemini API key is empty.")
@@ -127,7 +127,8 @@ class GoogleGeminiDocumentParsingGateway(DocumentParsingGateway):
             raise DocumentParsingError(
                 "Gemini 문서 파싱에 필요한 google-genai 패키지가 없습니다."
             )
-        self.client = client or genai.Client(api_key=normalized_api_key)
+        http_options = types.HttpOptions(timeout=timeout_ms) if timeout_ms else None
+        self.client = client or genai.Client(api_key=normalized_api_key, http_options=http_options)
 
     def parse_page_to_json(
         self,
@@ -169,7 +170,7 @@ class GoogleGeminiDocumentParsingGateway(DocumentParsingGateway):
                         top_k=top_k,
                         max_output_tokens=max_output_tokens,
                         response_mime_type="application/json",
-                        response_schema=build_page_parsing_response_schema(),
+                        response_json_schema=build_page_parsing_response_schema(),
                         thinking_config=types.ThinkingConfig(
                             thinking_level=thinking_level,
                         ),
@@ -621,7 +622,10 @@ def build_default_document_parsing_service(settings: Settings) -> DocumentParsin
         raise DocumentParsingError("Gemini API key is not configured.")
     return DocumentParsingService(
         settings=settings,
-        gateway=GoogleGeminiDocumentParsingGateway(settings.gemini_api_key),
+        gateway=GoogleGeminiDocumentParsingGateway(
+            settings.gemini_api_key,
+            timeout_ms=settings.gemini_http_timeout_ms,
+        ),
     )
 
 

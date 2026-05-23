@@ -1,6 +1,6 @@
 # medical-chatbot
 
-카카오톡 챗봇에서 `kakao_user_id`를 받아 환자를 식별하고, Google Drive의 진단기록을 조회하는 PoC입니다.
+카카오톡 챗봇에서 `kakao_user_id`를 해시 처리해 환자를 인증하고, Firestore Medical Wiki catalog로 Google Drive 원본 의료 문서를 선택한 뒤 Gemini Files API whole-document QA를 수행하는 PoC입니다.
 
 ## Run Locally
 
@@ -22,41 +22,43 @@ https://{ngrok-domain}/kakao/chat
 ## Required Setup
 
 - Cloud Run에서는 배포된 런타임 서비스 계정에 Google Drive 폴더 접근 권한을 공유해야 합니다.
+- Cloud Run 런타임 서비스 계정에 Firestore 접근 권한을 부여해야 합니다.
 - 로컬에서 서비스 계정 JSON 파일을 직접 쓰려면 `.env`에 `GOOGLE_SERVICE_ACCOUNT_PATH=credentials/google-service-account.json`를 설정합니다. 미설정 시 Application Default Credentials를 사용합니다.
-- `.env` 또는 실행 환경에 `GEMINI_API_KEY`를 설정해야 Gemini File Search Store 기반 질의응답이 동작합니다.
+- `.env` 또는 실행 환경에 `GEMINI_API_KEY`를 설정해야 Gemini Files API 기반 질의응답이 동작합니다.
+- `/admin/*` 엔드포인트를 쓰려면 `ADMIN_SYNC_TOKEN`을 설정하고 요청에 `X-Admin-Token` 헤더를 넣어야 합니다. 토큰 미설정 시 admin endpoint는 닫힙니다.
 - 카카오 AI 챗봇 callback 기능을 사용할 수 있어야 자유 질문이 5초 제한 안에서 동작합니다.
-- Google Drive에 `medical-chatbot/_system/patient_index.json`이 있어야 합니다.
-- 테스트 대상 환자는 `patient_index.json`에 `name`, `birth`, `folder_name`이 정확히 있어야 합니다.
-- 최초 매핑 검증 전에는 테스트 대상 카카오 계정의 `kakao_user_id`가 해당 환자 `kakao_user_ids`에 없어야 합니다.
+- Firestore `patients/{patient_id}` 문서에 `name`, `birth`, `drive_folder_id`, `status=active`가 있어야 인증과 sync가 동작합니다.
+- Google Drive는 환자별 원본 파일 저장소로만 사용하며, 런타임 운영 DB로 `_system/patient_index.json` 또는 `document_registry.json`을 사용하지 않습니다.
 
-## Patient Index Sync
+## Firestore Runtime
 
-Google Drive `patients/` 아래에 환자 폴더는 있지만 `_system/patient_index.json`에 누락된 경우 아래 명령으로 보정할 수 있습니다.
+런타임은 Firestore 기반 Medical Wiki + Gemini Files API 경로만 사용합니다.
 
-자동 보정으로 새로 추가되는 환자 엔트리에는 `phone_last4`가 기본적으로 빈 문자열 `""`로 들어갑니다.
+Firestore 주요 경로:
 
-```bash
-python -m app.tools.sync_patient_index
+```text
+patients/{patient_id}
+kakao_user_map/{kakao_user_id_hash}
+drive_sync_state/{scope_id}
+drive_folder_index/{drive_folder_id}
+drive_file_index/{drive_file_id}
+patients/{patient_id}/medical_sources/{source_id}
+patients/{patient_id}/medical_wiki_pages/{page_id}
+patients/{patient_id}/medical_wiki_index/main
+patients/{patient_id}/medical_source_runtime/{source_id}
+patients/{patient_id}/chat_sessions/{kakao_user_id_hash}
+patients/{patient_id}/chat_logs/{log_id}
+kakao_callback_jobs/{job_id}
 ```
 
-기본은 `dry-run`이며 변경 요약만 출력합니다. 실제로 Google Drive의 `patient_index.json`을 갱신하려면 아래처럼 실행합니다.
+Admin sync endpoints:
 
-```bash
-python -m app.tools.sync_patient_index --apply
-```
-
-## Document Registry Sync
-
-Google Drive 환자 폴더의 PDF를 기준으로 `_system/document_registry.json`과 환자별 Gemini File Search Store를 동기화하려면 아래 명령을 사용합니다.
-
-```bash
-python -m app.tools.sync_document_registry
-```
-
-기본은 `dry-run`이며 결과만 출력합니다. 실제로 `document_registry.json`을 갱신하려면 아래처럼 실행합니다.
-
-```bash
-python -m app.tools.sync_document_registry --apply
+```text
+POST /admin/sync-drive-changes
+POST /admin/sync-drive
+POST /admin/sync-drive/patient/{patient_id}
+POST /admin/rebuild-wiki-page/{patient_id}/{source_id}
+POST /admin/recompile-wiki-index/{patient_id}
 ```
 
 ## Markdown Parsing PoC
@@ -79,21 +81,13 @@ python -m app.tools.parse_drive_document \
 
 파싱 결과는 의료 원문을 포함할 수 있으므로 `artifacts/`는 git에 포함하지 않습니다.
 
-## Sync All
-
-관리자가 `patient_index.json` sync 후 바로 Gemini File Search Store/document registry sync까지 한 번에 실행하려면 아래 명령을 사용합니다.
-
-```bash
-python -m app.tools.sync_all --apply
-```
-
 ## Kakao Verification Flow
 
 1. 카카오톡 시작 블록 또는 인증하기 블록을 `/kakao/auth`에 연결합니다.
 2. 최신 기록 메뉴 또는 기록 기반 질문 블록을 `/kakao/chat`에 연결합니다.
 3. 카카오톡에서 챗봇에 일반 메시지(예: `안녕하세요`)를 보내 인증 안내가 오는지 확인합니다.
 4. 같은 카카오 계정으로 `인증 {이름} {생년월일}` 형식의 메시지를 보내 인증 성공 응답이 오는지 확인합니다.
-5. Google Drive의 `_system/patient_index.json`을 열어 해당 환자 `kakao_user_ids`에 실제 카카오 `userRequest.user.id`가 추가되었는지 확인합니다.
+5. Firestore `kakao_user_map/{sha256...}`에 인증 매핑이 생성되었는지 확인합니다.
 6. 같은 카카오 계정으로 `/kakao/chat` 경로에 연결된 최신 기록 메뉴 또는 `최신 기록 보여줘` 요청을 보내 재인증 없이 최신 기록 안내가 오는지 확인합니다.
 7. 자유 질문은 `/kakao/chat`으로 들어오며, callbackUrl이 포함된 요청이어야 최종 Gemini 답변이 callback으로 전달됩니다.
 8. 환자를 바꾸거나 재인증하려면 `인증 초기화`, `다른 환자 인증`, `환자 변경`, `재인증` 중 하나를 입력합니다.
@@ -101,9 +95,10 @@ python -m app.tools.sync_all --apply
 ## Logging
 
 - `/kakao/auth`, `/kakao/chat` 진입
-- patient index cache hit/miss
-- patient record cache hit/miss/warm
-- Gemini File Search Store sync / query
+- Firestore auth/session/chat log/callback job 처리
+- Drive Changes API sync
+- Medical Wiki page/index 생성
+- Gemini Files API upload/reuse 및 whole-document QA
 - callback enqueue / callback send success/failure
 
 위 로그를 보면 기본 동작 여부와 Gemini 호출 경로를 빠르게 확인할 수 있습니다.

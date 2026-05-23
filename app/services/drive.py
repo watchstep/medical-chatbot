@@ -1,31 +1,25 @@
 from __future__ import annotations
 
 import io
-import json
 import logging
-import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 import google.auth
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload
 
 from app.config import Settings
-from app.schemas import (
-    DocumentRegistry,
-    DocumentRegistryEntry,
-    DriveFile,
-    PatientIndex,
-    PatientIndexEntry,
-)
 
 
-FOLDER_MIME = "application/vnd.google-apps.folder"
-PATIENT_FOLDER_RE = re.compile(r"^(?P<patient_id>[^_]+)_(?P<name>.+)_(?P<birth>\d{8})$")
 logger = logging.getLogger(__name__)
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+GOOGLE_DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
+
+
+def _escape_drive_query_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
 class DriveLookupError(Exception):
@@ -34,64 +28,30 @@ class DriveLookupError(Exception):
         self.detail = detail
 
 
-@dataclass(frozen=True)
-class PatientFolderInventoryItem:
-    patient_id: str
-    name: str
-    birth: str
-    folder_name: str
-    folder_id: str
-
-
-@dataclass(frozen=True)
-class SkippedPatientFolder:
-    folder_name: str
-    folder_id: str
-    reason: str
-
-
-@dataclass(frozen=True)
-class PatientIndexSyncResult:
-    patient_index: PatientIndex
-    added: list[PatientIndexEntry]
-    updated: list[PatientIndexEntry]
-    unchanged: list[PatientIndexEntry]
-    skipped: list[SkippedPatientFolder]
-    missing_in_drive: list[PatientIndexEntry]
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "patient_index": self.patient_index.model_dump(exclude_none=True),
-            "added": [item.model_dump(exclude_none=True) for item in self.added],
-            "updated": [item.model_dump(exclude_none=True) for item in self.updated],
-            "unchanged": [item.model_dump(exclude_none=True) for item in self.unchanged],
-            "skipped": [asdict(item) for item in self.skipped],
-            "missing_in_drive": [
-                item.model_dump(exclude_none=True) for item in self.missing_in_drive
-            ],
-        }
-
-
 class DriveGateway:
-    def list_files(self, query: str) -> list[dict]:
+    def list_files_in_folder(self, folder_id: str) -> list[dict]:
+        raise NotImplementedError
+
+    def list_child_folders(self, folder_id: str) -> list[dict]:
+        raise NotImplementedError
+
+    def find_folders_by_name(self, folder_name: str, *, parent_id: str | None = None) -> list[dict]:
         raise NotImplementedError
 
     def download_file_bytes(self, file_id: str) -> bytes:
         raise NotImplementedError
 
+    def download_file_to_path(self, file_id: str, destination_path: str) -> None:
+        with open(destination_path, "wb") as destination:
+            destination.write(self.download_file_bytes(file_id))
+
     def get_file(self, file_id: str) -> dict:
         raise NotImplementedError
 
-    def update_file_bytes(self, file_id: str, content: bytes, mime_type: str) -> None:
+    def get_start_page_token(self) -> str:
         raise NotImplementedError
 
-    def create_file_bytes(
-        self,
-        parent_id: str,
-        file_name: str,
-        content: bytes,
-        mime_type: str,
-    ) -> str:
+    def list_changes(self, page_token: str, *, page_size: int) -> dict:
         raise NotImplementedError
 
 
@@ -107,25 +67,98 @@ class GoogleDriveGateway(DriveGateway):
             credentials, _ = google.auth.default(scopes=scopes)
         self.service = build("drive", "v3", credentials=credentials, cache_discovery=False)
 
-    def list_files(self, query: str) -> list[dict]:
+    def list_files_in_folder(self, folder_id: str) -> list[dict]:
         try:
-            response = (
-                self.service.files()
-                .list(
-                    q=query,
-                    fields="files(id,name,mimeType,modifiedTime,parents)",
-                    supportsAllDrives=True,
-                    includeItemsFromAllDrives=True,
+            files: list[dict] = []
+            page_token: str | None = None
+            while True:
+                response = (
+                    self.service.files()
+                    .list(
+                        q=f"'{_escape_drive_query_value(folder_id)}' in parents and trashed = false",
+                        fields="nextPageToken,files(id,name,mimeType,modifiedTime,parents,size,md5Checksum,trashed)",
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                        pageToken=page_token,
+                    )
+                    .execute()
                 )
-                .execute()
-            )
+                files.extend(response.get("files", []))
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    return files
         except HttpError as exc:
-            logger.exception("Google Drive list_files failed")
+            logger.exception("Google Drive list_files_in_folder failed")
             raise DriveLookupError(
-                "Google Drive 파일 목록 조회에 실패했습니다.",
+                "Google Drive 폴더 파일 목록 조회에 실패했습니다.",
                 detail=str(exc),
             ) from exc
-        return response.get("files", [])
+
+    def list_child_folders(self, folder_id: str) -> list[dict]:
+        try:
+            folders: list[dict] = []
+            page_token: str | None = None
+            while True:
+                response = (
+                    self.service.files()
+                    .list(
+                        q=(
+                            f"'{_escape_drive_query_value(folder_id)}' in parents and "
+                            f"mimeType = '{GOOGLE_DRIVE_FOLDER_MIME_TYPE}' and trashed = false"
+                        ),
+                        fields="nextPageToken,files(id,name,mimeType,modifiedTime,parents,trashed)",
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                        pageToken=page_token,
+                    )
+                    .execute()
+                )
+                folders.extend(response.get("files", []))
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    return folders
+        except HttpError as exc:
+            logger.exception("Google Drive list_child_folders failed")
+            raise DriveLookupError(
+                "Google Drive 하위 폴더 목록 조회에 실패했습니다.",
+                detail=str(exc),
+            ) from exc
+
+    def find_folders_by_name(self, folder_name: str, *, parent_id: str | None = None) -> list[dict]:
+        escaped_name = _escape_drive_query_value(folder_name)
+        clauses = [
+            f"mimeType = '{GOOGLE_DRIVE_FOLDER_MIME_TYPE}'",
+            "trashed = false",
+            f"name = '{escaped_name}'",
+        ]
+        if parent_id:
+            clauses.append(f"'{_escape_drive_query_value(parent_id)}' in parents")
+        query = " and ".join(clauses)
+        try:
+            folders: list[dict] = []
+            page_token: str | None = None
+            while True:
+                response = (
+                    self.service.files()
+                    .list(
+                        q=query,
+                        fields="nextPageToken,files(id,name,mimeType,modifiedTime,parents,trashed)",
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                        pageToken=page_token,
+                    )
+                    .execute()
+                )
+                folders.extend(response.get("files", []))
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    return folders
+        except HttpError as exc:
+            logger.exception("Google Drive find_folders_by_name failed")
+            raise DriveLookupError(
+                "Google Drive 폴더 이름 검색에 실패했습니다.",
+                detail=str(exc),
+            ) from exc
 
     def download_file_bytes(self, file_id: str) -> bytes:
         try:
@@ -143,13 +176,28 @@ class GoogleDriveGateway(DriveGateway):
             ) from exc
         return buffer.getvalue()
 
+    def download_file_to_path(self, file_id: str, destination_path: str) -> None:
+        try:
+            request = self.service.files().get_media(fileId=file_id)
+            with open(destination_path, "wb") as destination:
+                downloader = MediaIoBaseDownload(destination, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+        except HttpError as exc:
+            logger.exception("Google Drive download_file_to_path failed")
+            raise DriveLookupError(
+                "Google Drive 파일 다운로드에 실패했습니다.",
+                detail=str(exc),
+            ) from exc
+
     def get_file(self, file_id: str) -> dict:
         try:
             return (
                 self.service.files()
                 .get(
                     fileId=file_id,
-                    fields="id,name,mimeType,parents",
+                    fields="id,name,mimeType,parents,modifiedTime,size,md5Checksum,trashed",
                     supportsAllDrives=True,
                 )
                 .execute()
@@ -161,614 +209,46 @@ class GoogleDriveGateway(DriveGateway):
                 detail=str(exc),
             ) from exc
 
-    def update_file_bytes(self, file_id: str, content: bytes, mime_type: str) -> None:
+    def get_start_page_token(self) -> str:
         try:
-            media = MediaInMemoryUpload(content, mimetype=mime_type, resumable=False)
-            (
-                self.service.files()
-                .update(
-                    fileId=file_id,
-                    media_body=media,
-                    supportsAllDrives=True,
-                )
-                .execute()
-            )
+            response = self.service.changes().getStartPageToken(supportsAllDrives=True).execute()
+            return response["startPageToken"]
         except HttpError as exc:
-            logger.exception("Google Drive update_file_bytes failed")
+            logger.exception("Google Drive get_start_page_token failed")
             raise DriveLookupError(
-                "Google Drive 파일 저장에 실패했습니다.",
+                "Google Drive Changes API page token 조회에 실패했습니다.",
                 detail=str(exc),
             ) from exc
 
-    def create_file_bytes(
-        self,
-        parent_id: str,
-        file_name: str,
-        content: bytes,
-        mime_type: str,
-    ) -> str:
+    def list_changes(self, page_token: str, *, page_size: int) -> dict:
         try:
-            media = MediaInMemoryUpload(content, mimetype=mime_type, resumable=False)
-            created = (
-                self.service.files()
-                .create(
-                    body={
-                        "name": file_name,
-                        "parents": [parent_id],
-                    },
-                    media_body=media,
-                    fields="id",
+            return (
+                self.service.changes()
+                .list(
+                    pageToken=page_token,
+                    pageSize=page_size,
+                    fields=(
+                        "nextPageToken,newStartPageToken,"
+                        "changes(fileId,removed,file(id,name,mimeType,parents,modifiedTime,size,md5Checksum,trashed))"
+                    ),
                     supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                    includeRemoved=True,
                 )
                 .execute()
             )
         except HttpError as exc:
-            logger.exception("Google Drive create_file_bytes failed")
+            logger.exception("Google Drive list_changes failed")
             raise DriveLookupError(
-                "Google Drive 파일 생성에 실패했습니다.",
+                "Google Drive Changes API 변경 목록 조회에 실패했습니다.",
                 detail=str(exc),
             ) from exc
-        return created["id"]
 
 
 @dataclass
 class DriveLookupService:
     settings: Settings
     gateway: DriveGateway
-
-    def get_patient_by_kakao_user_id(self, kakao_user_id: str) -> PatientIndexEntry | None:
-        patient_index, _ = self.load_patient_index_with_file_id()
-        return next(
-            (item for item in patient_index.patients if kakao_user_id in item.kakao_user_ids),
-            None,
-        )
-
-    def authenticate_and_map_patient(
-        self,
-        kakao_user_id: str,
-        name: str,
-        birth: str,
-    ) -> PatientIndexEntry:
-        patient_index, patient_index_file_id = self.load_patient_index_with_file_id()
-        existing_patient = self._find_patient_by_kakao_user_id(patient_index, kakao_user_id)
-        if existing_patient is not None:
-            if existing_patient.name != name or existing_patient.birth != birth:
-                raise DriveLookupError("이미 다른 환자에 연결된 사용자입니다.")
-            return existing_patient
-
-        patient = self._find_patient_by_identity(patient_index, name, birth)
-        if patient is None:
-            raise DriveLookupError(
-                "등록된 환자 정보를 찾지 못했습니다. 병원에 등록 여부를 확인해 주세요."
-            )
-
-        updated_index = self._attach_kakao_user_id(
-            patient_index=patient_index,
-            target_patient_id=patient.patient_id,
-            kakao_user_id=kakao_user_id,
-        )
-        self._save_patient_index(patient_index_file_id, updated_index)
-        return self._find_patient_by_identity(updated_index, name, birth) or patient
-
-    def debug_probe(
-        self,
-        kakao_user_id: str | None = None,
-        name: str | None = None,
-        birth: str | None = None,
-    ) -> dict:
-        auth_mode = (
-            "service_account_file"
-            if self.settings.google_service_account_path
-            else "adc"
-        )
-        result: dict[str, object] = {
-            "root_folder_name": self.settings.drive_root_folder_name,
-            "auth_mode": auth_mode,
-        }
-
-        try:
-            root_id = self._find_root_folder_id()
-            result["root_folder_id"] = root_id
-
-            system_folder_id = self._find_child_folder_id(
-                parent_id=root_id,
-                folder_name=self.settings.drive_system_folder_name,
-            )
-            result["system_folder_id"] = system_folder_id
-
-            patient_index = self.load_patient_index()
-            result["patient_count"] = len(patient_index.patients)
-            result["patient_folder_names"] = [
-                patient.folder_name or patient.folder_id for patient in patient_index.patients
-            ]
-
-            patient: PatientIndexEntry | None = None
-            if kakao_user_id:
-                patient = self.get_patient_by_kakao_user_id(kakao_user_id)
-                result["mapping_found"] = patient is not None
-
-            if patient is None and name and birth:
-                patient = self._find_patient_by_identity(patient_index, name, birth)
-                result["identity_found"] = patient is not None
-
-            if patient is not None:
-                if kakao_user_id:
-                    result["authenticated_by"] = "kakao_user_id" if kakao_user_id in patient.kakao_user_ids else "identity"
-                latest_result, latest_chart = self._latest_ready_documents_for_patient(patient)
-                result["authenticated_patient_id"] = patient.patient_id
-                result["authenticated_folder_name"] = patient.folder_name
-                result["authenticated_folder_id"] = patient.folder_id
-                result["latest_visit_date"] = self._latest_document_date(
-                    latest_result,
-                    latest_chart,
-                )
-                result["latest_result"] = latest_result.filename if latest_result else None
-                result["latest_chart"] = latest_chart.filename if latest_chart else None
-            elif kakao_user_id and name and birth:
-                patient = self.authenticate_and_map_patient(
-                    kakao_user_id=kakao_user_id,
-                    name=name,
-                    birth=birth,
-                )
-                result["mapping_found"] = False
-                result["mapping_saved"] = True
-                result["authenticated_by"] = "identity"
-                latest_result, latest_chart = self._latest_ready_documents_for_patient(patient)
-                result["authenticated_patient_id"] = patient.patient_id
-                result["authenticated_folder_name"] = patient.folder_name
-                result["authenticated_folder_id"] = patient.folder_id
-                result["latest_visit_date"] = self._latest_document_date(
-                    latest_result,
-                    latest_chart,
-                )
-                result["latest_result"] = latest_result.filename if latest_result else None
-                result["latest_chart"] = latest_chart.filename if latest_chart else None
-        except DriveLookupError as exc:
-            result["ok"] = False
-            result["error"] = str(exc)
-            if exc.detail:
-                result["detail"] = exc.detail
-            return result
-
-        result["ok"] = True
-        return result
-
-    def load_patient_index(self) -> PatientIndex:
-        patient_index, _ = self.load_patient_index_with_file_id()
-        return patient_index
-
-    def load_document_registry(self) -> DocumentRegistry:
-        document_registry, _ = self.load_document_registry_with_file_id()
-        return document_registry
-
-    def persist_patient_index(
-        self,
-        *,
-        patient_index_file_id: str,
-        patient_index: PatientIndex,
-    ) -> None:
-        self._save_patient_index(patient_index_file_id, patient_index)
-
-    def persist_document_registry(
-        self,
-        *,
-        document_registry_file_id: str | None,
-        document_registry: DocumentRegistry,
-    ) -> str:
-        return self._save_document_registry(document_registry_file_id, document_registry)
-
-    def sync_patient_index(self) -> PatientIndexSyncResult:
-        patient_index, _ = self.load_patient_index_with_file_id()
-        inventory, skipped = self.list_patient_folders()
-
-        inventory_by_patient_id = {
-            item.patient_id: item for item in inventory
-        }
-        added: list[PatientIndexEntry] = []
-        updated: list[PatientIndexEntry] = []
-        unchanged: list[PatientIndexEntry] = []
-        reconciled_patients: list[PatientIndexEntry] = []
-
-        for patient in patient_index.patients:
-            inventory_item = inventory_by_patient_id.pop(patient.patient_id, None)
-            if inventory_item is None:
-                reconciled_patients.append(patient)
-                unchanged.append(patient)
-                continue
-
-            reconciled_patient = patient.model_copy(
-                update={
-                    "name": inventory_item.name,
-                    "birth": inventory_item.birth,
-                    "folder_name": inventory_item.folder_name,
-                    "folder_id": inventory_item.folder_id,
-                }
-            )
-            reconciled_patients.append(reconciled_patient)
-            if reconciled_patient == patient:
-                unchanged.append(reconciled_patient)
-            else:
-                updated.append(reconciled_patient)
-
-        for inventory_item in sorted(
-            inventory_by_patient_id.values(),
-            key=lambda item: (item.patient_id, item.folder_name),
-        ):
-            new_patient = PatientIndexEntry(
-                patient_id=inventory_item.patient_id,
-                name=inventory_item.name,
-                birth=inventory_item.birth,
-                folder_name=inventory_item.folder_name,
-                folder_id=inventory_item.folder_id,
-                kakao_user_ids=[],
-                phone_last4="",
-            )
-            reconciled_patients.append(new_patient)
-            added.append(new_patient)
-
-        missing_in_drive = [
-            patient
-            for patient in patient_index.patients
-            if patient.patient_id not in {item.patient_id for item in inventory}
-        ]
-
-        return PatientIndexSyncResult(
-            patient_index=PatientIndex(patients=reconciled_patients),
-            added=added,
-            updated=updated,
-            unchanged=unchanged,
-            skipped=skipped,
-            missing_in_drive=missing_in_drive,
-        )
-
-    def list_patient_folders(
-        self,
-    ) -> tuple[list[PatientFolderInventoryItem], list[SkippedPatientFolder]]:
-        root_id = self._find_root_folder_id()
-        patients_folder_id = self._find_child_folder_id(
-            parent_id=root_id,
-            folder_name="patients",
-        )
-        files = self.gateway.list_files(
-            f"'{patients_folder_id}' in parents and "
-            f"mimeType = '{FOLDER_MIME}' and trashed = false"
-        )
-
-        parsed_items: list[PatientFolderInventoryItem] = []
-        skipped: list[SkippedPatientFolder] = []
-        for file in files:
-            folder_id = file["id"]
-            folder_name = file["name"]
-            match = PATIENT_FOLDER_RE.match(folder_name)
-            if match is None:
-                skipped.append(
-                    SkippedPatientFolder(
-                        folder_name=folder_name,
-                        folder_id=folder_id,
-                        reason="invalid_folder_name_format",
-                    )
-                )
-                continue
-            parsed_items.append(
-                PatientFolderInventoryItem(
-                    patient_id=match.group("patient_id"),
-                    name=match.group("name"),
-                    birth=match.group("birth"),
-                    folder_name=folder_name,
-                    folder_id=folder_id,
-                )
-            )
-
-        inventory: list[PatientFolderInventoryItem] = []
-        patient_id_counts: dict[str, int] = {}
-        for item in parsed_items:
-            patient_id_counts[item.patient_id] = patient_id_counts.get(item.patient_id, 0) + 1
-        for item in parsed_items:
-            if patient_id_counts[item.patient_id] > 1:
-                skipped.append(
-                    SkippedPatientFolder(
-                        folder_name=item.folder_name,
-                        folder_id=item.folder_id,
-                        reason="duplicate_patient_id",
-                    )
-                )
-                continue
-            inventory.append(item)
-
-        inventory.sort(key=lambda item: (item.patient_id, item.folder_name))
-        skipped.sort(key=lambda item: (item.folder_name, item.folder_id))
-        return inventory, skipped
-
-    def load_patient_index_with_file_id(self) -> tuple[PatientIndex, str]:
-        try:
-            root_id = self._find_root_folder_id()
-            system_folder_id = self._find_child_folder_id(
-                parent_id=root_id,
-                folder_name=self.settings.drive_system_folder_name,
-            )
-            patient_index_file_id = self._find_file_id(
-                parent_id=system_folder_id,
-                file_name=self.settings.patient_index_file_name,
-            )
-            content = self.gateway.download_file_bytes(patient_index_file_id)
-            return PatientIndex.model_validate(json.loads(content.decode("utf-8"))), patient_index_file_id
-        except DriveLookupError:
-            raise
-        except Exception as exc:
-            logger.exception("Failed to load patient index")
-            raise DriveLookupError(
-                "patient_index.json 조회에 실패했습니다.",
-                detail=str(exc),
-            ) from exc
-
-    def load_document_registry_with_file_id(self) -> tuple[DocumentRegistry, str | None]:
-        try:
-            root_id = self._find_root_folder_id()
-            system_folder_id = self._find_child_folder_id(
-                parent_id=root_id,
-                folder_name=self.settings.drive_system_folder_name,
-            )
-            document_registry_file_id = self._find_optional_file_id(
-                parent_id=system_folder_id,
-                file_name=self.settings.document_registry_file_name,
-            )
-            if document_registry_file_id is None:
-                return DocumentRegistry(documents=[]), None
-            content = self.gateway.download_file_bytes(document_registry_file_id)
-            return (
-                DocumentRegistry.model_validate(json.loads(content.decode("utf-8"))),
-                document_registry_file_id,
-            )
-        except DriveLookupError:
-            raise
-        except Exception as exc:
-            logger.exception("Failed to load document registry")
-            raise DriveLookupError(
-                "document_registry.json 조회에 실패했습니다.",
-                detail=str(exc),
-            ) from exc
-
-    def _latest_ready_documents_for_patient(
-        self,
-        patient: PatientIndexEntry,
-    ) -> tuple[DocumentRegistryEntry | None, DocumentRegistryEntry | None]:
-        registry = self.load_document_registry()
-        ready_documents = [
-            item
-            for item in registry.documents
-            if item.patient_id == patient.patient_id and item.sync_status == "READY"
-        ]
-        return (
-            self._latest_document_by_type(ready_documents, "result"),
-            self._latest_document_by_type(ready_documents, "chart"),
-        )
-
-    def _latest_document_by_type(
-        self,
-        documents: list[DocumentRegistryEntry],
-        document_type: str,
-    ) -> DocumentRegistryEntry | None:
-        matches = [item for item in documents if item.document_type == document_type]
-        if not matches:
-            return None
-        return max(matches, key=lambda item: (item.document_date, item.filename))
-
-    def _latest_document_date(
-        self,
-        *documents: DocumentRegistryEntry | None,
-    ) -> str | None:
-        dates = [item.document_date for item in documents if item is not None and item.document_date]
-        if not dates:
-            return None
-        return max(dates)
-
-    def download_drive_file_bytes(self, drive_file: DriveFile) -> bytes:
-        try:
-            return self.gateway.download_file_bytes(drive_file.file_id)
-        except DriveLookupError:
-            raise
-        except Exception as exc:
-            logger.exception("Failed to download drive file bytes")
-            raise DriveLookupError(
-                "환자 문서 다운로드에 실패했습니다.",
-                detail=str(exc),
-            ) from exc
-
-    def list_patient_document_files(self, patient: PatientIndexEntry) -> list[dict]:
-        try:
-            patient_folder_id = self._get_patient_folder_id(patient)
-            return self.gateway.list_files(
-                f"'{patient_folder_id}' in parents and trashed = false"
-            )
-        except DriveLookupError:
-            raise
-        except Exception as exc:
-            logger.exception("Failed to list patient document files")
-            raise DriveLookupError(
-                "환자 문서 목록 조회에 실패했습니다.",
-                detail=str(exc),
-            ) from exc
-
-    def _save_patient_index(self, patient_index_file_id: str, patient_index: PatientIndex) -> None:
-        try:
-            content = json.dumps(
-                patient_index.model_dump(exclude_none=True),
-                ensure_ascii=False,
-                indent=2,
-            ).encode("utf-8")
-            self.gateway.update_file_bytes(
-                patient_index_file_id,
-                content,
-                "application/json",
-            )
-        except DriveLookupError:
-            raise
-        except Exception as exc:
-            logger.exception("Failed to save patient index")
-            raise DriveLookupError(
-                "patient_index.json 저장에 실패했습니다.",
-                detail=str(exc),
-            ) from exc
-
-    def _save_document_registry(
-        self,
-        document_registry_file_id: str | None,
-        document_registry: DocumentRegistry,
-    ) -> str:
-        try:
-            content = json.dumps(
-                document_registry.model_dump(exclude_none=True),
-                ensure_ascii=False,
-                indent=2,
-            ).encode("utf-8")
-            if document_registry_file_id is not None:
-                self.gateway.update_file_bytes(
-                    document_registry_file_id,
-                    content,
-                    "application/json",
-                )
-                return document_registry_file_id
-
-            root_id = self._find_root_folder_id()
-            system_folder_id = self._find_child_folder_id(
-                parent_id=root_id,
-                folder_name=self.settings.drive_system_folder_name,
-            )
-            return self.gateway.create_file_bytes(
-                system_folder_id,
-                self.settings.document_registry_file_name,
-                content,
-                "application/json",
-            )
-        except DriveLookupError:
-            raise
-        except Exception as exc:
-            logger.exception("Failed to save document registry")
-            raise DriveLookupError(
-                "document_registry.json 저장에 실패했습니다.",
-                detail=str(exc),
-            ) from exc
-
-    def _find_patient_by_kakao_user_id(
-        self,
-        patient_index: PatientIndex,
-        kakao_user_id: str,
-    ) -> PatientIndexEntry | None:
-        return next(
-            (item for item in patient_index.patients if kakao_user_id in item.kakao_user_ids),
-            None,
-        )
-
-    def _find_patient_by_identity(
-        self,
-        patient_index: PatientIndex,
-        name: str,
-        birth: str,
-    ) -> PatientIndexEntry | None:
-        return next(
-            (
-                item
-                for item in patient_index.patients
-                if item.name == name and item.birth == birth
-            ),
-            None,
-        )
-
-    def _attach_kakao_user_id(
-        self,
-        patient_index: PatientIndex,
-        target_patient_id: str,
-        kakao_user_id: str,
-    ) -> PatientIndex:
-        owner = self._find_patient_by_kakao_user_id(patient_index, kakao_user_id)
-        if owner is not None and owner.patient_id != target_patient_id:
-            raise DriveLookupError("이미 다른 환자에 연결된 사용자입니다.")
-
-        updated_patients: list[PatientIndexEntry] = []
-        for patient in patient_index.patients:
-            if patient.patient_id == target_patient_id:
-                kakao_user_ids = list(patient.kakao_user_ids)
-                if kakao_user_id not in kakao_user_ids:
-                    kakao_user_ids.append(kakao_user_id)
-                updated_patients.append(
-                    patient.model_copy(update={"kakao_user_ids": kakao_user_ids})
-                )
-            else:
-                updated_patients.append(patient)
-
-        return PatientIndex(patients=updated_patients)
-
-    def _resolve_patient_folder_id(
-        self,
-        parent_id: str,
-        folder_name: str,
-        folder_id: str | None,
-    ) -> str:
-        if not folder_name:
-            raise DriveLookupError("patient_index.json에 환자 폴더 정보가 없습니다.")
-
-        try:
-            return self._find_child_folder_id(
-                parent_id=parent_id,
-                folder_name=folder_name,
-            )
-        except DriveLookupError:
-            if not folder_id:
-                raise
-
-        file_info = self.gateway.get_file(folder_id)
-        if file_info.get("mimeType") != FOLDER_MIME:
-            raise DriveLookupError("환자 폴더 정보가 올바르지 않습니다.")
-        parents = file_info.get("parents", [])
-        if parent_id in parents:
-            return folder_id
-        raise DriveLookupError("환자 폴더가 patients 하위에 없습니다.")
-
-    def _get_patient_folder_id(self, patient: PatientIndexEntry) -> str:
-        root_id = self._find_root_folder_id()
-        patients_folder_id = self._find_child_folder_id(
-            parent_id=root_id,
-            folder_name="patients",
-        )
-        return self._resolve_patient_folder_id(
-            parent_id=patients_folder_id,
-            folder_name=patient.folder_name,
-            folder_id=patient.folder_id,
-        )
-
-    def _find_root_folder_id(self) -> str:
-        files = self.gateway.list_files(
-            f"name = '{self.settings.drive_root_folder_name}' "
-            f"and mimeType = '{FOLDER_MIME}' and trashed = false"
-        )
-        if not files:
-            raise DriveLookupError("Google Drive 루트 폴더를 찾지 못했습니다.")
-        return files[0]["id"]
-
-    def _find_child_folder_id(self, parent_id: str, folder_name: str) -> str:
-        files = self.gateway.list_files(
-            f"'{parent_id}' in parents and name = '{folder_name}' "
-            f"and mimeType = '{FOLDER_MIME}' and trashed = false"
-        )
-        if not files:
-            raise DriveLookupError(f"Google Drive 폴더를 찾지 못했습니다: {folder_name}")
-        return files[0]["id"]
-
-    def _find_file_id(self, parent_id: str, file_name: str) -> str:
-        files = self.gateway.list_files(
-            f"'{parent_id}' in parents and name = '{file_name}' and trashed = false"
-        )
-        if not files:
-            raise DriveLookupError(f"Google Drive 파일을 찾지 못했습니다: {file_name}")
-        return files[0]["id"]
-
-    def _find_optional_file_id(self, parent_id: str, file_name: str) -> str | None:
-        files = self.gateway.list_files(
-            f"'{parent_id}' in parents and name = '{file_name}' and trashed = false"
-        )
-        if not files:
-            return None
-        return files[0]["id"]
 
 
 def build_default_drive_service(settings: Settings) -> DriveLookupService:
