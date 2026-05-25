@@ -155,6 +155,134 @@ class MedicalRouterServiceTest(unittest.TestCase):
         self.assertEqual(selection.primary_source_id, "")
         self.assertEqual(selection.reason, "router confidence below threshold")
 
+    def test_ok_insufficient_falls_back_to_best_effort_catalog_source(self) -> None:
+        gateway = FakeRouterGateway(
+            {
+                "selection_status": "insufficient",
+                "intent": "OK",
+                "primary_source_id": "",
+                "confidence": 0.9,
+                "reason": "catalog is thin and does not show an exact answer",
+            }
+        )
+        index = MedicalWikiIndex(
+            patient_id="P0001",
+            pages=[
+                MedicalWikiIndexPage(
+                    page_id="PAGE_SRC_P0001_LAB",
+                    source_id="SRC_P0001_LAB",
+                    category="lab_result",
+                    date="2026-05-02",
+                    description="검사 결과 문서입니다.",
+                    tags=["검사결과"],
+                    anchors=["혈당"],
+                    open_when=["검사 결과 확인"],
+                    confidence=0.95,
+                ),
+                MedicalWikiIndexPage(
+                    page_id="PAGE_SRC_P0001_MIXED",
+                    source_id="SRC_P0001_MIXED",
+                    category="mixed_medical_record",
+                    date="2026-04-01",
+                    description="진료기록, 검사결과, 처방내역을 함께 확인할 수 있는 복합 의료 기록입니다.",
+                    tags=["복합기록", "진료기록"],
+                    anchors=["진료", "처방", "검사"],
+                    open_when=["전반적인 의료 기록 확인"],
+                    confidence=0.8,
+                ),
+            ],
+        )
+        service = MedicalRouterService(
+            settings=Settings(_env_file=None, gemini_api_key="test-key"),
+            gateway=gateway,
+        )
+
+        selection = service.select_source(
+            question="제 의료 기록에서 확인해줘",
+            prior_context="",
+            wiki_index=index,
+        )
+
+        self.assertEqual(selection.selection_status, "selected")
+        self.assertEqual(selection.primary_source_id, "SRC_P0001_MIXED")
+        self.assertEqual(selection.reason, "best-effort catalog source selected for original record verification")
+
+    def test_ok_insufficient_fallback_excludes_strong_skip_match(self) -> None:
+        gateway = FakeRouterGateway(
+            {
+                "selection_status": "insufficient",
+                "intent": "OK",
+                "primary_source_id": "",
+                "confidence": 0.9,
+                "reason": "catalog is thin and does not show an exact answer",
+            }
+        )
+        index = MedicalWikiIndex(
+            patient_id="P0001",
+            pages=[
+                MedicalWikiIndexPage(
+                    page_id="PAGE_SRC_P0001_MIXED",
+                    source_id="SRC_P0001_MIXED",
+                    category="mixed_medical_record",
+                    date="2026-05-02",
+                    description="진료기록, 검사결과, 처방내역을 함께 확인할 수 있는 복합 의료 기록입니다.",
+                    tags=["복합기록"],
+                    anchors=["진료", "처방", "검사"],
+                    open_when=["전반적인 의료 기록 확인"],
+                    skip_when=["검사 결과 확인"],
+                    confidence=0.95,
+                ),
+                MedicalWikiIndexPage(
+                    page_id="PAGE_SRC_P0001_LAB",
+                    source_id="SRC_P0001_LAB",
+                    category="lab_result",
+                    date="2026-04-01",
+                    description="검사 결과 문서입니다.",
+                    tags=["검사결과"],
+                    anchors=["혈당"],
+                    open_when=["검사 결과 확인"],
+                    confidence=0.8,
+                ),
+            ],
+        )
+        service = MedicalRouterService(
+            settings=Settings(_env_file=None, gemini_api_key="test-key"),
+            gateway=gateway,
+        )
+
+        selection = service.select_source(
+            question="검사 결과 확인",
+            prior_context="",
+            wiki_index=index,
+        )
+
+        self.assertEqual(selection.selection_status, "selected")
+        self.assertEqual(selection.primary_source_id, "SRC_P0001_LAB")
+
+    def test_general_ok_insufficient_does_not_fallback_to_source(self) -> None:
+        gateway = FakeRouterGateway(
+            {
+                "selection_status": "insufficient",
+                "intent": "OK",
+                "primary_source_id": "",
+                "confidence": 0.9,
+                "reason": "general medical question; source not required",
+            }
+        )
+        service = MedicalRouterService(
+            settings=Settings(_env_file=None, gemini_api_key="test-key"),
+            gateway=gateway,
+        )
+
+        selection = service.select_source(
+            question="고혈압이 뭐야?",
+            prior_context="",
+            wiki_index=build_index(),
+        )
+
+        self.assertEqual(selection.selection_status, "insufficient")
+        self.assertEqual(selection.primary_source_id, "")
+
     def test_needs_review_pages_are_excluded_from_gemini_catalog(self) -> None:
         gateway = FakeRouterGateway(
             {

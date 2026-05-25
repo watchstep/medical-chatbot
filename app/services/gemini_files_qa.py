@@ -48,6 +48,18 @@ logger = logging.getLogger(__name__)
 QA_INTENTS = {"OK"}
 FIXED_RESPONSE_INTENTS = {"EMERGENCY", "PRIVACY_BLOCK", "COST_BLOCK", "OUT_OF_SCOPE"}
 SOURCE_NOT_REQUIRED_INTENTS = FIXED_RESPONSE_INTENTS
+ROUTER_CATEGORY_PRIORITY = {
+    "mixed_medical_record": 100,
+    "doctor_note": 90,
+    "discharge_summary": 80,
+    "diagnosis_certificate": 75,
+    "health_checkup": 70,
+    "lab_result": 60,
+    "imaging_report": 60,
+    "prescription": 55,
+    "referral": 50,
+    "unknown": 10,
+}
 
 
 class GeminiFilesQaError(Exception):
@@ -206,6 +218,8 @@ class MedicalRouterService:
         selection = RouterSelection.model_validate_json(raw_selection)
         return self._validate_router_selection(
             selection,
+            question=question,
+            catalog_pages=catalog["pages"],
             allowed_source_ids=allowed_source_ids,
         )
 
@@ -247,6 +261,8 @@ class MedicalRouterService:
         self,
         selection: RouterSelection,
         *,
+        question: str,
+        catalog_pages: list[dict[str, Any]],
         allowed_source_ids: set[str],
     ) -> RouterSelection:
         """Normalize and validate Router output before callback branching.
@@ -275,7 +291,11 @@ class MedicalRouterService:
             )
 
         if selection.selection_status == "insufficient":
-            return selection.model_copy(update={"primary_source_id": ""})
+            return self._best_effort_fallback_selection(
+                selection.model_copy(update={"primary_source_id": ""}),
+                question=question,
+                catalog_pages=catalog_pages,
+            )
 
         if selection.primary_source_id not in allowed_source_ids:
             return selection.model_copy(
@@ -297,6 +317,96 @@ class MedicalRouterService:
             )
 
         return selection
+
+    def _best_effort_fallback_selection(
+        self,
+        selection: RouterSelection,
+        *,
+        question: str,
+        catalog_pages: list[dict[str, Any]],
+    ) -> RouterSelection:
+        if selection.intent != "OK":
+            return selection
+        if not catalog_pages:
+            return selection
+        if self._ok_question_does_not_need_source(reason=selection.reason):
+            return selection
+
+        candidates = [
+            page
+            for page in catalog_pages
+            if not self._strong_skip_match(question, page.get("skip_when", []))
+        ]
+        if not candidates:
+            return selection
+
+        best = max(
+            candidates,
+            key=lambda page: (
+                ROUTER_CATEGORY_PRIORITY.get(str(page.get("category") or "unknown"), 0),
+                self._catalog_overlap_score(question=question, page=page),
+                str(page.get("date") or ""),
+                float(page.get("confidence") or 0.0),
+                str(page.get("page_id") or ""),
+            ),
+        )
+        source_id = str(best.get("source_id") or "")
+        if not source_id:
+            return selection
+        return RouterSelection(
+            selection_status="selected",
+            intent="OK",
+            primary_source_id=source_id,
+            confidence=max(self.settings.router_min_confidence, 0.55),
+            reason="best-effort catalog source selected for original record verification",
+        )
+
+    def _ok_question_does_not_need_source(self, *, reason: str) -> bool:
+        normalized_reason = (reason or "").casefold()
+        if any(token in normalized_reason for token in ["source not required", "general medical", "general answer"]):
+            return True
+        if any(token in normalized_reason for token in ["일반 의학", "일반적인", "개념 설명", "문서 없이"]):
+            return True
+        return False
+
+    def _catalog_overlap_score(self, *, question: str, page: dict[str, Any]) -> int:
+        question_tokens = set(self._tokens(question.lower()))
+        if not question_tokens:
+            return 0
+        haystack = self._catalog_haystack(page)
+        return sum(1 for token in question_tokens if token in haystack)
+
+    def _catalog_haystack(self, page: dict[str, Any]) -> str:
+        values = [
+            page.get("category", ""),
+            page.get("description", ""),
+            self._join_catalog_values(page.get("tags", [])),
+            self._join_catalog_values(page.get("anchors", [])),
+            self._join_catalog_values(page.get("open_when", [])),
+        ]
+        return " ".join(str(value) for value in values).lower()
+
+    def _join_catalog_values(self, value: object) -> str:
+        if not isinstance(value, list):
+            return ""
+        return " ".join(str(item) for item in value)
+
+    def _strong_skip_match(self, question: str, skip_when: object) -> bool:
+        if not isinstance(skip_when, list):
+            return False
+        normalized_question = question.casefold().replace(" ", "")
+        question_tokens = set(self._tokens(question.casefold()))
+        for item in skip_when:
+            cleaned = " ".join(str(item).strip().casefold().split())
+            if not cleaned:
+                continue
+            normalized_item = cleaned.replace(" ", "")
+            if len(normalized_item) >= 4 and normalized_item in normalized_question:
+                return True
+            item_tokens = set(self._tokens(cleaned))
+            if len(item_tokens) >= 2 and len(question_tokens & item_tokens) >= 2:
+                return True
+        return False
 
     def _select_source_keyword(
         self,
@@ -356,6 +466,22 @@ class MedicalRouterService:
         )
         return self._validate_router_selection(
             selection,
+            question=question,
+            catalog_pages=[
+                {
+                    "page_id": page.page_id,
+                    "source_id": page.source_id,
+                    "category": page.category,
+                    "date": page.date,
+                    "description": page.description,
+                    "tags": list(page.tags),
+                    "anchors": list(page.anchors),
+                    "open_when": list(page.open_when),
+                    "skip_when": list(getattr(page, "skip_when", [])),
+                    "confidence": page.confidence,
+                }
+                for page in candidates
+            ],
             allowed_source_ids={page.source_id for page in candidates},
         )
 

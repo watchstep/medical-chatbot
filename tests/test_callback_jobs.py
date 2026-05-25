@@ -390,14 +390,14 @@ class CallbackJobProcessorTest(unittest.TestCase):
             "고혈압은 혈압이 지속적으로 높은 상태를 말합니다.",
         )
 
-    def test_patient_record_question_without_matching_source_returns_cannot_verify(self) -> None:
+    def test_patient_record_question_without_exact_router_match_uses_fallback_source(self) -> None:
         self._create_job(message="나 고혈압이야?")
 
         result = self.processor.process_job("JOB_TEST")
 
         self.assertEqual(result.status, "CALLBACK_SENT")
-        self.assertEqual(self.qa_service.calls, ["answer", "render"])
-        self.assertIn("의료 기록에서 확인하기 어렵습니다", self.callback_service.calls[0]["text"])
+        self.assertEqual(self.qa_service.calls, ["prepare", "answer", "render"])
+        self.assertIn("문서에서 관련 내용이 확인됩니다", self.callback_service.calls[0]["text"])
 
 
     def test_fixed_intent_emergency_bypasses_final_qa(self) -> None:
