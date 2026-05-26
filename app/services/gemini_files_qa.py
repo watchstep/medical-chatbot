@@ -1240,8 +1240,8 @@ class GeminiFilesQaService:
         selected_source_id: str = "",
     ) -> str:
         fixed_messages = {
-            "emergency": "🚨 즉시 의료기관을 방문하시길 바랍니다.",
-            "blocked": "🔒 개인정보 보호 정책에 따라 성함 이외의 세부 개인정보는 안내해 드리지 않습니다.",
+            "emergency": "🧑‍⚕️ 증상이 지속된다면 의료기관을 찾아 전문의와 상의해 보시길 권합니다.",
+            "blocked": "🔒 개인정보 보호 정책에 따라 세부 개인정보는 안내해 드리지 않습니다.",
             "cost_block": "💳 비용 관련 정보는 해당 의료기관에 직접 문의하셔야 합니다.",
             "out_of_scope": "💬 의료 기록과 관련된 질문에만 답변을 드릴 수 있습니다.",
             "cannot_verify": "🔍 해당 내용은 제공된 의료 기록에서 확인하기 어렵습니다.",

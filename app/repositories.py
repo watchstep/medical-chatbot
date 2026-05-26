@@ -229,6 +229,19 @@ class MedicalRepository:
     def update_chat_log_job(self, patient_id: str, log_id: str, job_id: str) -> None:
         raise NotImplementedError
 
+    def list_chat_logs_for_patient(self, patient_id: str, *, start_at: str, end_at: str) -> list[ChatLog]:
+        raise NotImplementedError
+
+    def list_chat_logs_for_dashboard(
+        self,
+        *,
+        start_at: str = "",
+        end_at: str = "",
+        limit: int,
+        offset: int = 0,
+    ) -> list[tuple[PatientProfile, ChatLog]]:
+        raise NotImplementedError
+
     def create_callback_job(self, job: KakaoCallbackJob) -> str:
         raise NotImplementedError
 
@@ -252,6 +265,12 @@ class MedicalRepository:
         raise NotImplementedError
 
     def list_expired_callback_jobs(self, *, now: str, limit: int) -> list[KakaoCallbackJob]:
+        raise NotImplementedError
+
+    def count_callback_jobs_by_status(self) -> dict[str, int]:
+        raise NotImplementedError
+
+    def list_recent_failed_callback_jobs(self, *, limit: int) -> list[KakaoCallbackJob]:
         raise NotImplementedError
 
     def upsert_callback_job(self, job: KakaoCallbackJob) -> None:
@@ -553,6 +572,37 @@ class InMemoryMedicalRepository(MedicalRepository):
         if log is not None:
             self.chat_logs[(patient_id, log_id)] = log.model_copy(update={"job_id": job_id})
 
+    def list_chat_logs_for_patient(self, patient_id: str, *, start_at: str, end_at: str) -> list[ChatLog]:
+        logs = [
+            self._copy(log)
+            for (stored_patient_id, _), log in self.chat_logs.items()
+            if stored_patient_id == patient_id and start_at <= log.created_at < end_at
+        ]
+        return sorted(logs, key=lambda item: (item.created_at, item.log_id))
+
+    def list_chat_logs_for_dashboard(
+        self,
+        *,
+        start_at: str = "",
+        end_at: str = "",
+        limit: int,
+        offset: int = 0,
+    ) -> list[tuple[PatientProfile, ChatLog]]:
+        patients = {patient.patient_id: patient for patient in self.list_active_patients()}
+        items: list[tuple[PatientProfile, ChatLog]] = []
+        for (patient_id, _), log in self.chat_logs.items():
+            patient = patients.get(patient_id)
+            in_range = True
+            if start_at:
+                in_range = in_range and log.created_at >= start_at
+            if end_at:
+                in_range = in_range and log.created_at < end_at
+            if patient is not None and in_range:
+                items.append((self._copy(patient), self._copy(log)))
+        items.sort(key=lambda item: (item[1].created_at, item[1].log_id), reverse=True)
+        safe_offset = max(0, offset)
+        return items[safe_offset:safe_offset + limit]
+
     def create_callback_job(self, job: KakaoCallbackJob) -> str:
         self.callback_jobs[job.job_id] = self._copy(job)
         return job.job_id
@@ -639,6 +689,24 @@ class InMemoryMedicalRepository(MedicalRepository):
                 if len(result) >= limit:
                     break
         return result
+
+    def count_callback_jobs_by_status(self) -> dict[str, int]:
+        counts = {
+            "PENDING": 0,
+            "PROCESSING": 0,
+            "FAILED": 0,
+            "EXPIRED": 0,
+            "CALLBACK_SENT": 0,
+        }
+        for job in self.callback_jobs.values():
+            if job.status in counts:
+                counts[job.status] += 1
+        return counts
+
+    def list_recent_failed_callback_jobs(self, *, limit: int) -> list[KakaoCallbackJob]:
+        jobs = [self._copy(job) for job in self.callback_jobs.values() if job.status == "FAILED"]
+        jobs.sort(key=lambda item: (item.updated_at or item.created_at, item.job_id), reverse=True)
+        return jobs[:limit]
 
     def upsert_callback_job(self, job: KakaoCallbackJob) -> None:
         self.callback_jobs[job.job_id] = self._copy(job)
@@ -1103,6 +1171,47 @@ class FirestoreMedicalRepository(MedicalRepository):
     def update_chat_log_job(self, patient_id: str, log_id: str, job_id: str) -> None:
         self._doc("patients", patient_id, "chat_logs", log_id).set({"job_id": job_id}, merge=True)
 
+    def list_chat_logs_for_patient(self, patient_id: str, *, start_at: str, end_at: str) -> list[ChatLog]:
+        query = (
+            self.client.collection("patients")
+            .document(patient_id)
+            .collection("chat_logs")
+            .where("created_at", ">=", start_at)
+            .where("created_at", "<", end_at)
+            .order_by("created_at")
+        )
+        return [ChatLog.model_validate(snapshot.to_dict() or {}) for snapshot in query.stream()]
+
+    def list_chat_logs_for_dashboard(
+        self,
+        *,
+        start_at: str = "",
+        end_at: str = "",
+        limit: int,
+        offset: int = 0,
+    ) -> list[tuple[PatientProfile, ChatLog]]:
+        items: list[tuple[PatientProfile, ChatLog]] = []
+        for patient in self.list_active_patients():
+            if start_at and end_at:
+                logs = self.list_chat_logs_for_patient(patient.patient_id, start_at=start_at, end_at=end_at)
+            else:
+                query = (
+                    self.client.collection("patients")
+                    .document(patient.patient_id)
+                    .collection("chat_logs")
+                    .order_by("created_at")
+                )
+                logs = [ChatLog.model_validate(snapshot.to_dict() or {}) for snapshot in query.stream()]
+            for log in logs:
+                if start_at and log.created_at < start_at:
+                    continue
+                if end_at and log.created_at >= end_at:
+                    continue
+                items.append((patient, log))
+        items.sort(key=lambda item: (item[1].created_at, item[1].log_id), reverse=True)
+        safe_offset = max(0, offset)
+        return items[safe_offset:safe_offset + limit]
+
     def create_callback_job(self, job: KakaoCallbackJob) -> str:
         self._set_model(job, "kakao_callback_jobs", job.job_id)
         return job.job_id
@@ -1202,6 +1311,25 @@ class FirestoreMedicalRepository(MedicalRepository):
                 if len(result) >= limit:
                     break
         return result
+
+    def count_callback_jobs_by_status(self) -> dict[str, int]:
+        counts = {
+            "PENDING": 0,
+            "PROCESSING": 0,
+            "FAILED": 0,
+            "EXPIRED": 0,
+            "CALLBACK_SENT": 0,
+        }
+        for status in counts:
+            query = self.client.collection("kakao_callback_jobs").where("status", "==", status)
+            counts[status] = sum(1 for _ in query.stream())
+        return counts
+
+    def list_recent_failed_callback_jobs(self, *, limit: int) -> list[KakaoCallbackJob]:
+        query = self.client.collection("kakao_callback_jobs").where("status", "==", "FAILED")
+        jobs = [KakaoCallbackJob.model_validate(snapshot.to_dict() or {}) for snapshot in query.stream()]
+        jobs.sort(key=lambda item: (item.updated_at or item.created_at, item.job_id), reverse=True)
+        return jobs[:limit]
 
     def upsert_callback_job(self, job: KakaoCallbackJob) -> None:
         self._set_model(job, "kakao_callback_jobs", job.job_id)

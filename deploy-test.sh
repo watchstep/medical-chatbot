@@ -15,6 +15,7 @@ DRIVE_CHANGES_JOB_NAME="${DRIVE_CHANGES_JOB_NAME:-medical-chatbot-test-sync-driv
 FULL_SYNC_JOB_NAME="${FULL_SYNC_JOB_NAME:-medical-chatbot-test-sync-drive-full}"
 CALLBACK_JOBS_JOB_NAME="${CALLBACK_JOBS_JOB_NAME:-medical-chatbot-test-process-callback-jobs}"
 GEMINI_FILES_CLEANUP_JOB_NAME="${GEMINI_FILES_CLEANUP_JOB_NAME:-medical-chatbot-test-cleanup-gemini-files}"
+LEGACY_CHAT_LOG_EXPORT_JOB_NAME="${LEGACY_CHAT_LOG_EXPORT_JOB_NAME:-medical-chatbot-test-export-chat-logs}"
 CALLBACK_TASKS_QUEUE_NAME="${CALLBACK_TASKS_QUEUE_NAME:-medical-chatbot-test-callback-jobs}"
 PREWARM_TASKS_QUEUE_NAME="${PREWARM_TASKS_QUEUE_NAME:-medical-chatbot-test-prewarm}"
 WIKI_REBUILD_TASKS_QUEUE_NAME="${WIKI_REBUILD_TASKS_QUEUE_NAME:-medical-chatbot-test-wiki-rebuild}"
@@ -119,6 +120,9 @@ SESSION_TTL_MINUTES="${SESSION_TTL_MINUTES:-1440}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
 GEMINI_SECRET_NAME="${GEMINI_SECRET_NAME:-gemini-api-key}"
+ADMIN_DASHBOARD_ENABLED="${ADMIN_DASHBOARD_ENABLED:-false}"
+ADMIN_DASHBOARD_USERNAME="${ADMIN_DASHBOARD_USERNAME:-admin}"
+ADMIN_DASHBOARD_PASSWORD_SECRET_NAME="${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME:-admin-dashboard-password}"
 
 if [[ -z "${GOOGLE_DRIVE_ROOT_FOLDER_ID}" ]]; then
   echo "WARNING: GOOGLE_DRIVE_ROOT_FOLDER_ID is empty." >&2
@@ -128,7 +132,7 @@ fi
 
 gcloud config set project "${PROJECT_ID}"
 
-gcloud services enable cloudtasks.googleapis.com run.googleapis.com firestore.googleapis.com cloudscheduler.googleapis.com --project "${PROJECT_ID}" >/dev/null
+gcloud services enable cloudtasks.googleapis.com run.googleapis.com firestore.googleapis.com cloudscheduler.googleapis.com secretmanager.googleapis.com --project "${PROJECT_ID}" >/dev/null
 
 
 ensure_firestore_composite_indexes() {
@@ -189,6 +193,27 @@ configure_tasks_queue() {
     --max-retry-duration="${retry_duration}" >/dev/null
 }
 
+grant_secret_access() {
+  local secret_name="$1"
+  if [[ -z "${secret_name}" ]]; then
+    return
+  fi
+  gcloud secrets add-iam-policy-binding "${secret_name}" \
+    --project "${PROJECT_ID}" \
+    --member="serviceAccount:${RUN_SA}" \
+    --role="roles/secretmanager.secretAccessor" >/dev/null
+}
+
+pause_scheduler_job_if_exists() {
+  local job_name="$1"
+  if gcloud scheduler jobs describe "${job_name}" --project "${PROJECT_ID}" --location "${REGION}" >/dev/null 2>&1; then
+    gcloud scheduler jobs pause "${job_name}" \
+      --project "${PROJECT_ID}" \
+      --location "${REGION}" >/dev/null || true
+    echo "Paused legacy scheduler job: ${job_name}"
+  fi
+}
+
 if [[ "${ENSURE_FIRESTORE_INDEXES}" == "true" ]]; then
   ensure_firestore_composite_indexes
 fi
@@ -204,9 +229,10 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="serviceAccount:${RUN_SA}" \
   --role="roles/datastore.user" >/dev/null
 
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="serviceAccount:${RUN_SA}" \
-  --role="roles/secretmanager.secretAccessor" >/dev/null
+grant_secret_access "${GEMINI_SECRET_NAME}"
+if [[ "${ADMIN_DASHBOARD_ENABLED}" == "true" ]]; then
+  grant_secret_access "${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME}"
+fi
 
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="serviceAccount:${RUN_SA}" \
@@ -299,6 +325,8 @@ ADMIN_AUTH_MODE: "${ADMIN_AUTH_MODE}"
 ADMIN_SYNC_TOKEN: "${ADMIN_SYNC_TOKEN}"
 ADMIN_OIDC_ALLOWED_EMAILS: "${ALLOWED_EMAILS}"
 ADMIN_OIDC_AUDIENCE: ""
+ADMIN_DASHBOARD_ENABLED: "${ADMIN_DASHBOARD_ENABLED}"
+ADMIN_DASHBOARD_USERNAME: "${ADMIN_DASHBOARD_USERNAME}"
 MEDICAL_WIKI_EXTRACTION_MODE: "${MEDICAL_WIKI_EXTRACTION_MODE}"
 ROUTER_MODE: "${ROUTER_MODE}"
 CALLBACK_WORKER_MODE: "${CALLBACK_WORKER_MODE}"
@@ -362,6 +390,11 @@ SESSION_TTL_MINUTES: "${SESSION_TTL_MINUTES}"
 LOG_LEVEL: "${LOG_LEVEL}"
 YAML
 
+SET_SECRETS="GEMINI_API_KEY=${GEMINI_SECRET_NAME}:latest"
+if [[ "${ADMIN_DASHBOARD_ENABLED}" == "true" ]]; then
+  SET_SECRETS="${SET_SECRETS},ADMIN_DASHBOARD_PASSWORD=${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME}:latest"
+fi
+
 # Deploy test Cloud Run service. Use env-vars-file to safely support comma-separated values.
 gcloud run deploy "${SERVICE_NAME}" \
   --project "${PROJECT_ID}" \
@@ -373,7 +406,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --cpu 1 \
   --allow-unauthenticated \
   --env-vars-file "${ENV_VARS_FILE}" \
-  --set-secrets "GEMINI_API_KEY=${GEMINI_SECRET_NAME}:latest"
+  --set-secrets "${SET_SECRETS}"
 
 SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
   --project "${PROJECT_ID}" \
@@ -429,6 +462,7 @@ if [[ "${CREATE_SCHEDULER_JOBS}" == "true" ]]; then
   create_or_update_job "${DRIVE_CHANGES_JOB_NAME}" "*/1 * * * *" "/admin/sync-drive-changes"
   create_or_update_job "${FULL_SYNC_JOB_NAME}" "0 3 * * *" "/admin/sync-drive"
   create_or_update_job "${GEMINI_FILES_CLEANUP_JOB_NAME}" "*/30 * * * *" "/admin/cleanup-gemini-files"
+  pause_scheduler_job_if_exists "${LEGACY_CHAT_LOG_EXPORT_JOB_NAME}"
 
   if [[ "${CALLBACK_WORKER_MODE}" == "cloud_tasks" ]]; then
     if gcloud scheduler jobs describe "${CALLBACK_JOBS_JOB_NAME}" --project "${PROJECT_ID}" --location "${REGION}" >/dev/null 2>&1; then
@@ -468,6 +502,8 @@ Callback Cloud Tasks queue: ${CALLBACK_TASKS_QUEUE_NAME}
 Callback queue rate/concurrency/attempts: ${CALLBACK_TASKS_MAX_DISPATCHES_PER_SECOND}/${CALLBACK_TASKS_MAX_CONCURRENT_DISPATCHES}/${CALLBACK_TASKS_MAX_ATTEMPTS}
 Prewarm Cloud Tasks queue: ${PREWARM_TASKS_QUEUE_NAME}
 Prewarm queue rate/concurrency/attempts: ${PREWARM_TASKS_MAX_DISPATCHES_PER_SECOND}/${PREWARM_TASKS_MAX_CONCURRENT_DISPATCHES}/${PREWARM_TASKS_MAX_ATTEMPTS}
+Admin dashboard enabled: ${ADMIN_DASHBOARD_ENABLED}
+Legacy chat log export scheduler paused if present: ${LEGACY_CHAT_LOG_EXPORT_JOB_NAME}
 Wiki rebuild worker mode: ${WIKI_REBUILD_WORKER_MODE}
 Wiki rebuild Cloud Tasks queue: ${WIKI_REBUILD_TASKS_QUEUE_NAME}
 Wiki rebuild queue rate/concurrency/attempts: ${WIKI_REBUILD_TASKS_MAX_DISPATCHES_PER_SECOND}/${WIKI_REBUILD_TASKS_MAX_CONCURRENT_DISPATCHES}/${WIKI_REBUILD_TASKS_MAX_ATTEMPTS}

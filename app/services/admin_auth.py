@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import secrets
+import base64
+import binascii
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +22,7 @@ except ImportError:  # pragma: no cover - dependency guard for minimal test envs
 logger = logging.getLogger(__name__)
 
 GOOGLE_OIDC_ISSUERS = {"https://accounts.google.com", "accounts.google.com"}
+DASHBOARD_BASIC_REALM = "Medical Chatbot Admin"
 
 
 class AdminAuthError(Exception):
@@ -56,6 +59,31 @@ def is_admin_request(request: Request, settings: Settings) -> bool:
             return False
 
     return False
+
+
+def is_dashboard_request(request: Request, settings: Settings) -> bool:
+    if not settings.admin_dashboard_enabled:
+        return False
+    expected_username = settings.admin_dashboard_username or ""
+    expected_password = settings.admin_dashboard_password or ""
+    if not expected_username or not expected_password:
+        return False
+
+    auth_header = request.headers.get("authorization", "")
+    scheme, _, value = auth_header.partition(" ")
+    if scheme.lower() != "basic" or not value.strip():
+        return False
+    try:
+        decoded = base64.b64decode(value.strip(), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return False
+    username, separator, password = decoded.partition(":")
+    if not separator:
+        return False
+    return secrets.compare_digest(username, expected_username) and secrets.compare_digest(
+        password,
+        expected_password,
+    )
 
 
 def verify_admin_oidc_request(request: Request, settings: Settings) -> AdminPrincipal:

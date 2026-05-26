@@ -20,4 +20,69 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 cd "${ROOT_DIR}"
+
+read_dotenv_value() {
+  local key="$1"
+  if [[ ! -f ".env" ]]; then
+    return
+  fi
+  awk -v key="${key}" '
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      split(line, parts, "=")
+      env_key = parts[1]
+      sub(/[[:space:]]*$/, "", env_key)
+      if (env_key == key) {
+        sub(/^[^=]*=/, "", line)
+        sub(/^[[:space:]]*/, "", line)
+        sub(/[[:space:]]*$/, "", line)
+        if ((substr(line, 1, 1) == "\"" && substr(line, length(line), 1) == "\"") ||
+            (substr(line, 1, 1) == "'"'"'" && substr(line, length(line), 1) == "'"'"'")) {
+          line = substr(line, 2, length(line) - 2)
+        }
+        print line
+        exit
+      }
+    }
+  ' .env
+}
+
+load_optional_env_from_dotenv() {
+  local key="$1"
+  if [[ -n "${!key:-}" ]]; then
+    return
+  fi
+  local value
+  value="$(read_dotenv_value "${key}")"
+  if [[ -n "${value}" ]]; then
+    export "${key}=${value}"
+  fi
+}
+
+load_optional_env_from_dotenv "ADMIN_DASHBOARD_ENABLED"
+load_optional_env_from_dotenv "ADMIN_DASHBOARD_USERNAME"
+load_optional_env_from_dotenv "ADMIN_DASHBOARD_PASSWORD_SECRET_NAME"
+
+ADMIN_DASHBOARD_PASSWORD_VALUE="${ADMIN_DASHBOARD_PASSWORD:-}"
+if [[ -z "${ADMIN_DASHBOARD_PASSWORD_VALUE}" ]]; then
+  ADMIN_DASHBOARD_PASSWORD_VALUE="$(read_dotenv_value "ADMIN_DASHBOARD_PASSWORD")"
+fi
+
+export ADMIN_DASHBOARD_PASSWORD_SECRET_NAME="${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME:-admin-dashboard-password}"
+if [[ -n "${ADMIN_DASHBOARD_PASSWORD_VALUE}" ]]; then
+  export ADMIN_DASHBOARD_ENABLED="true"
+  gcloud services enable secretmanager.googleapis.com --project "${PROJECT_ID}" >/dev/null
+  if ! gcloud secrets describe "${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+    gcloud secrets create "${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME}" \
+      --project "${PROJECT_ID}" \
+      --replication-policy="automatic" >/dev/null
+  fi
+  printf "%s" "${ADMIN_DASHBOARD_PASSWORD_VALUE}" | gcloud secrets versions add "${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME}" \
+    --project "${PROJECT_ID}" \
+    --data-file=- >/dev/null
+  echo "Updated admin dashboard password secret: ${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME}"
+fi
+
 exec ./deploy-test.sh

@@ -171,9 +171,24 @@ class FirestoreChatbotService:
 
         if self._is_latest_record_intent(utterance):
             self._try_enqueue_prewarm(patient_id=patient.patient_id, reason="medical_record_lookup")
-            return build_simple_text_response(self._latest_record_message(patient.patient_id))
+            answer_text = self._latest_record_message(patient.patient_id)
+            self._create_assistant_chat_log(
+                patient=patient,
+                kakao_user_id_hash=kakao_user_id_hash,
+                message=answer_text,
+                message_type="system",
+                related_log_id=chat_log_id,
+            )
+            return build_simple_text_response(answer_text)
 
         if not callback_url:
+            self._create_assistant_chat_log(
+                patient=patient,
+                kakao_user_id_hash=kakao_user_id_hash,
+                message=CALLBACK_UNAVAILABLE_MESSAGE,
+                message_type="system",
+                related_log_id=chat_log_id,
+            )
             return build_simple_text_response(CALLBACK_UNAVAILABLE_MESSAGE)
 
         now = datetime.now(KST)
@@ -208,6 +223,14 @@ class FirestoreChatbotService:
         self.repository.update_chat_log_job(patient.patient_id, chat_log_id, job_id)
 
         if not self._dispatch_callback_job(job=job, background_tasks=background_tasks):
+            self._create_assistant_chat_log(
+                patient=patient,
+                kakao_user_id_hash=kakao_user_id_hash,
+                message=CALLBACK_UNAVAILABLE_MESSAGE,
+                message_type="system",
+                related_log_id=chat_log_id,
+                job_id=job_id,
+            )
             return build_simple_text_response(CALLBACK_UNAVAILABLE_MESSAGE)
         return build_callback_ack_response()
 
@@ -397,6 +420,31 @@ class FirestoreChatbotService:
                 kakao_user_id_hash=kakao_user_id_hash,
                 message=message,
                 message_type=message_type,
+                created_at=now_kst_iso(),
+            )
+        )
+        return log_id
+
+    def _create_assistant_chat_log(
+        self,
+        *,
+        patient: PatientProfile,
+        kakao_user_id_hash: str,
+        message: str,
+        message_type: str,
+        related_log_id: str,
+        job_id: str | None = None,
+    ) -> str:
+        log_id = f"ANSWER_{job_id}" if job_id else f"ANSWER_{related_log_id}"
+        self.repository.create_chat_log(
+            ChatLog(
+                log_id=log_id,
+                patient_id=patient.patient_id,
+                kakao_user_id_hash=kakao_user_id_hash,
+                role="assistant",
+                message=message,
+                message_type=message_type,
+                job_id=job_id,
                 created_at=now_kst_iso(),
             )
         )

@@ -240,8 +240,8 @@ class FakeGeminiFilesQaService:
         fixed_messages = {
             "cannot_verify": "🔍 해당 내용은 제공된 의료 기록에서 확인하기 어렵습니다.",
             "out_of_scope": "💬 의료 기록과 관련된 질문에만 답변을 드릴 수 있습니다.",
-            "emergency": "🚨 즉시 의료기관을 방문하시길 바랍니다.",
-            "blocked": "🔒 개인정보 보호 정책에 따라 성함 이외의 세부 개인정보는 안내해 드리지 않습니다.",
+            "emergency": "🧑‍⚕️ 증상이 지속된다면 의료기관을 찾아 전문의와 상의해 보시길 권합니다.",
+            "blocked": "🔒 개인정보 보호 정책에 따라 세부 개인정보는 안내해 드리지 않습니다.",
             "cost_block": "💳 비용 관련 정보는 해당 의료기관에 직접 문의하셔야 합니다.",
         }
         if answer.status in fixed_messages:
@@ -377,6 +377,36 @@ class CallbackJobProcessorTest(unittest.TestCase):
         self.assertEqual(stored.status, "CALLBACK_SENT")
         self.assertEqual(stored.callback_sent_count, 1)
         self.assertEqual(stored.sent_text_type, "answer")
+        answer_log = self.repository.get_chat_log("P0001", "ANSWER_JOB_TEST")
+        assert answer_log is not None
+        self.assertEqual(answer_log.role, "assistant")
+        self.assertEqual(answer_log.message_type, "answer")
+        self.assertEqual(answer_log.message, self.callback_service.calls[0]["text"])
+        self.assertEqual(answer_log.job_id, "JOB_TEST")
+
+    def test_reprocessing_sent_job_does_not_duplicate_answer_log(self) -> None:
+        self._create_job()
+
+        first = self.processor.process_job("JOB_TEST")
+        second = self.processor.process_job("JOB_TEST")
+
+        self.assertEqual(first.status, "CALLBACK_SENT")
+        self.assertEqual(second.status, "CALLBACK_SENT")
+        answer_logs = [
+            log
+            for log in self.repository.chat_logs.values()
+            if log.role == "assistant" and log.job_id == "JOB_TEST"
+        ]
+        self.assertEqual(len(answer_logs), 1)
+
+    def test_callback_send_failure_does_not_store_answer_log(self) -> None:
+        self.callback_service.fail = True
+        self._create_job()
+
+        result = self.processor.process_job("JOB_TEST")
+
+        self.assertEqual(result.error_code, "CALLBACK_SEND_FAILED")
+        self.assertIsNone(self.repository.get_chat_log("P0001", "ANSWER_JOB_TEST"))
 
     def test_general_medical_question_does_not_require_source(self) -> None:
         self._create_job(message="고혈압이 뭐야?")
@@ -407,7 +437,7 @@ class CallbackJobProcessorTest(unittest.TestCase):
 
         self.assertEqual(result.status, "CALLBACK_SENT")
         self.assertEqual(self.qa_service.calls, ["render"])
-        self.assertEqual(self.callback_service.calls[0]["text"], "🚨 즉시 의료기관을 방문하시길 바랍니다.")
+        self.assertEqual(self.callback_service.calls[0]["text"], "🧑‍⚕️ 증상이 지속된다면 의료기관을 찾아 전문의와 상의해 보시길 권합니다.")
 
     def test_fixed_intent_cost_block_bypasses_final_qa(self) -> None:
         self._create_job(message="진료비 얼마야?")
@@ -427,7 +457,7 @@ class CallbackJobProcessorTest(unittest.TestCase):
         self.assertEqual(self.qa_service.calls, ["render"])
         self.assertEqual(
             self.callback_service.calls[0]["text"],
-            "🔒 개인정보 보호 정책에 따라 성함 이외의 세부 개인정보는 안내해 드리지 않습니다.",
+            "🔒 개인정보 보호 정책에 따라 세부 개인정보는 안내해 드리지 않습니다.",
         )
 
     def test_fixed_intent_out_of_scope_bypasses_final_qa(self) -> None:

@@ -11,6 +11,7 @@ from typing import Any
 from app.config import Settings
 from app.repositories import MedicalRepository
 from app.schemas import (
+    ChatLog,
     ChatSession,
     FinalQaAnswer,
     KakaoCallbackJob,
@@ -41,8 +42,8 @@ FIXED_INTENT_TO_STATUS = {
     "OUT_OF_SCOPE": "out_of_scope",
 }
 FIXED_STATUS_MESSAGES = {
-    "emergency": "🚨 즉시 의료기관을 방문하시길 바랍니다.",
-    "blocked": "🔒 개인정보 보호 정책에 따라 성함 이외의 세부 개인정보는 안내해 드리지 않습니다.",
+    "emergency": "🧑‍⚕️ 증상이 지속된다면 의료기관을 찾아 전문의와 상의해 보시길 권합니다.",
+    "blocked": "🔒 개인정보 보호 정책에 따라 세부 개인정보는 안내해 드리지 않습니다.",
     "cost_block": "💳 비용 관련 정보는 해당 의료기관에 직접 문의하셔야 합니다.",
     "out_of_scope": OUT_OF_SCOPE_MESSAGE,
     "cannot_verify": SAFE_FALLBACK_MESSAGE,
@@ -476,6 +477,7 @@ class CallbackJobProcessor:
                 text_type=text_type,
             )
             callback_send_done = True
+            self._store_delivered_answer_log(job=job, answer_text=answer_text, text_type=text_type)
             sent = job.model_copy(
                 update={
                     "status": "CALLBACK_SENT",
@@ -514,6 +516,23 @@ class CallbackJobProcessor:
                 keep_retryable=True,
             )
             return CallbackJobProcessResult(job_id=job.job_id, status=failed.status, error_code="CALLBACK_SEND_FAILED")
+
+    def _store_delivered_answer_log(self, *, job: KakaoCallbackJob, answer_text: str, text_type: str) -> None:
+        try:
+            self.repository.create_chat_log(
+                ChatLog(
+                    log_id=f"ANSWER_{job.job_id}",
+                    patient_id=job.patient_id,
+                    kakao_user_id_hash=job.kakao_user_id_hash,
+                    role="assistant",
+                    message=answer_text,
+                    message_type="answer" if text_type == "answer" else "system",
+                    job_id=job.job_id,
+                    created_at=now_kst_iso(),
+                )
+            )
+        except Exception:
+            logger.exception("failed to store delivered assistant answer log job_id=%s", job.job_id)
 
     def process_pending_jobs(self, *, limit: int | None = None) -> dict[str, object]:
         now = now_kst_iso()

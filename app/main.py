@@ -4,6 +4,7 @@ import logging
 import os
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 
 from app.config import Settings, get_settings
 from app.repositories import MedicalRepository, build_default_medical_repository
@@ -28,6 +29,12 @@ from app.services.gemini_file_prewarm import (
 from app.services.kakao_callback import KakaoCallbackService
 from app.services.wiki_rebuild_tasks import WikiRebuildTaskEnqueueService
 from app.services.admin_auth import is_admin_request
+from app.services.admin_auth import DASHBOARD_BASIC_REALM, is_dashboard_request
+from app.services.admin_dashboard import (
+    DASHBOARD_DEFAULT_CHAT_LOG_LIMIT,
+    AdminDashboardService,
+    dashboard_html,
+)
 from app.services.medical_wiki import MedicalWikiService
 from app.services.medical_wiki_extractor import (
     MedicalWikiExtractor,
@@ -64,6 +71,7 @@ def create_app(
     app.state.gemini_file_prewarm_service = None
     app.state.gemini_file_prewarm_enqueue_service = None
     app.state.wiki_rebuild_task_enqueue_service = None
+    app.state.admin_dashboard_service = None
     app.state.medical_repository = medical_repository
     app.state.kakao_callback_service = kakao_callback_service or KakaoCallbackService(
         timeout_seconds=app_settings.kakao_callback_timeout_seconds,
@@ -72,6 +80,93 @@ def create_app(
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/admin/dashboard", response_class=HTMLResponse)
+    async def admin_dashboard(request: Request) -> HTMLResponse:
+        _require_dashboard_authorized(request)
+        return HTMLResponse(dashboard_html())
+
+    @app.get("/admin/dashboard/status")
+    async def admin_dashboard_status(request: Request) -> dict:
+        _require_dashboard_authorized(request)
+        dashboard = _get_or_init_admin_dashboard_service(request)
+        if dashboard is None:
+            return {"firestore": "unavailable", "drive": "unavailable"}
+        return dashboard.status()
+
+    @app.get("/admin/dashboard/chat-logs")
+    async def admin_dashboard_chat_logs(
+        request: Request,
+        mode: str = "recent",
+        start_at: str = "",
+        end_at: str = "",
+        limit: int = DASHBOARD_DEFAULT_CHAT_LOG_LIMIT,
+        page: int = 1,
+    ) -> dict:
+        _require_dashboard_authorized(request)
+        dashboard = _get_or_init_admin_dashboard_service(request)
+        if dashboard is None:
+            return {"ok": False, "error": "dashboard service unavailable", "items": []}
+        return dashboard.chat_logs(
+            mode=mode,
+            start_at=start_at,
+            end_at=end_at,
+            limit=limit,
+            page=page,
+        )
+
+    @app.get("/admin/dashboard/callback-jobs")
+    async def admin_dashboard_callback_jobs(request: Request, limit: int = 20) -> dict:
+        _require_dashboard_authorized(request)
+        dashboard = _get_or_init_admin_dashboard_service(request)
+        if dashboard is None:
+            return {"ok": False, "error": "dashboard service unavailable", "counts": {}, "recent_failed_jobs": []}
+        return dashboard.callback_jobs(limit=limit)
+
+    @app.get("/admin/dashboard/logs-link")
+    async def admin_dashboard_logs_link(request: Request) -> dict:
+        _require_dashboard_authorized(request)
+        dashboard = _get_or_init_admin_dashboard_service(request)
+        if dashboard is None:
+            return {"url": ""}
+        return dashboard.logs_link()
+
+    @app.post("/admin/dashboard/actions/sync-drive-changes")
+    async def admin_dashboard_sync_drive_changes(request: Request) -> dict:
+        _require_dashboard_authorized(request)
+        sync_service = _get_or_init_drive_changes_sync_service(request)
+        if sync_service is None:
+            return {"ok": False, "error": "sync service unavailable"}
+        return sync_service.sync_changes().to_dict()
+
+    @app.post("/admin/dashboard/actions/sync-drive-full")
+    async def admin_dashboard_sync_drive_full(request: Request) -> dict:
+        _require_dashboard_authorized(request)
+        bootstrap_payload: dict | None = None
+        if request.app.state.settings.drive_patient_bootstrap_on_full_sync:
+            bootstrap_service = _get_or_init_patient_bootstrap_service(request)
+            if bootstrap_service is None:
+                return {"ok": False, "error": "patient bootstrap service unavailable"}
+            bootstrap_result = bootstrap_service.bootstrap()
+            bootstrap_payload = bootstrap_result.to_dict()
+            if not bootstrap_result.ok:
+                return {"ok": False, "error": "patient bootstrap failed", "bootstrap": bootstrap_payload}
+        sync_service = _get_or_init_drive_changes_sync_service(request)
+        if sync_service is None:
+            return {"ok": False, "error": "sync service unavailable", "bootstrap": bootstrap_payload}
+        payload = sync_service.sync_all().to_dict()
+        if bootstrap_payload is not None:
+            payload["bootstrap"] = bootstrap_payload
+        return payload
+
+    @app.post("/admin/dashboard/actions/cleanup-gemini-files")
+    async def admin_dashboard_cleanup_gemini_files(request: Request, force: bool = True) -> dict:
+        _require_dashboard_authorized(request)
+        cleanup_service = _get_or_init_gemini_files_cleanup_service(request)
+        if cleanup_service is None:
+            return {"ok": False, "error": "gemini files cleanup service unavailable"}
+        result = cleanup_service.cleanup_to_target(reason="dashboard") if force else cleanup_service.cleanup_if_needed()
+        return result.model_dump()
 
     @app.get("/debug/drive")
     async def debug_drive(
@@ -215,7 +310,6 @@ def create_app(
         result = cleanup_service.cleanup_to_target(reason="manual_or_scheduled") if force else cleanup_service.cleanup_if_needed()
         return result.model_dump()
 
-
     @app.post("/admin/prewarm-gemini-file")
     async def admin_prewarm_gemini_file(request: Request) -> dict:
         if not _admin_authorized(request):
@@ -252,6 +346,19 @@ def _simple_system_error_response() -> dict:
 
 def _admin_authorized(request: Request) -> bool:
     return is_admin_request(request, request.app.state.settings)
+
+
+def _require_dashboard_authorized(request: Request) -> None:
+    settings = request.app.state.settings
+    if not settings.admin_dashboard_enabled:
+        raise HTTPException(status_code=404, detail="dashboard is disabled")
+    if is_dashboard_request(request, settings):
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="dashboard authentication required",
+        headers={"WWW-Authenticate": f'Basic realm="{DASHBOARD_BASIC_REALM}"'},
+    )
 
 
 def _get_or_init_drive_service(request: Request) -> DriveLookupService | None:
@@ -358,6 +465,22 @@ def _get_or_init_gemini_files_cleanup_service(request: Request) -> GeminiFilesCl
         gateway=qa_service.gateway,
     )
     return request.app.state.gemini_files_cleanup_service
+
+
+def _get_or_init_admin_dashboard_service(request: Request) -> AdminDashboardService | None:
+    service = getattr(request.app.state, "admin_dashboard_service", None)
+    if service is not None:
+        return service
+    repository = _get_or_init_medical_repository(request)
+    if repository is None:
+        return None
+    drive_gateway = _get_or_init_drive_gateway(request)
+    request.app.state.admin_dashboard_service = AdminDashboardService(
+        settings=request.app.state.settings,
+        repository=repository,
+        drive_gateway=drive_gateway,
+    )
+    return request.app.state.admin_dashboard_service
 
 
 def _get_or_init_medical_router_service(request: Request) -> MedicalRouterService | None:

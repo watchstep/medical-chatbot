@@ -8,7 +8,7 @@ import google.auth
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from app.config import Settings
 
@@ -36,6 +36,37 @@ class DriveGateway:
         raise NotImplementedError
 
     def find_folders_by_name(self, folder_name: str, *, parent_id: str | None = None) -> list[dict]:
+        raise NotImplementedError
+
+    def find_files_by_name(
+        self,
+        file_name: str,
+        *,
+        parent_id: str | None = None,
+        mime_type: str | None = None,
+    ) -> list[dict]:
+        raise NotImplementedError
+
+    def create_folder(self, folder_name: str, *, parent_id: str | None = None) -> dict:
+        raise NotImplementedError
+
+    def upload_file_bytes(
+        self,
+        *,
+        parent_id: str,
+        file_name: str,
+        content: bytes,
+        mime_type: str,
+    ) -> dict:
+        raise NotImplementedError
+
+    def update_file_bytes(
+        self,
+        *,
+        file_id: str,
+        content: bytes,
+        mime_type: str,
+    ) -> dict:
         raise NotImplementedError
 
     def download_file_bytes(self, file_id: str) -> bytes:
@@ -160,6 +191,127 @@ class GoogleDriveGateway(DriveGateway):
                 detail=str(exc),
             ) from exc
 
+    def find_files_by_name(
+        self,
+        file_name: str,
+        *,
+        parent_id: str | None = None,
+        mime_type: str | None = None,
+    ) -> list[dict]:
+        escaped_name = _escape_drive_query_value(file_name)
+        clauses = [
+            "trashed = false",
+            f"name = '{escaped_name}'",
+        ]
+        if parent_id:
+            clauses.append(f"'{_escape_drive_query_value(parent_id)}' in parents")
+        if mime_type:
+            clauses.append(f"mimeType = '{_escape_drive_query_value(mime_type)}'")
+        query = " and ".join(clauses)
+        try:
+            files: list[dict] = []
+            page_token: str | None = None
+            while True:
+                response = (
+                    self.service.files()
+                    .list(
+                        q=query,
+                        fields="nextPageToken,files(id,name,mimeType,parents,trashed,webViewLink)",
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                        pageToken=page_token,
+                    )
+                    .execute()
+                )
+                files.extend(response.get("files", []))
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    return files
+        except HttpError as exc:
+            logger.exception("Google Drive find_files_by_name failed")
+            raise DriveLookupError(
+                "Google Drive 파일 이름 검색에 실패했습니다.",
+                detail=str(exc),
+            ) from exc
+
+    def create_folder(self, folder_name: str, *, parent_id: str | None = None) -> dict:
+        metadata: dict[str, object] = {
+            "name": folder_name,
+            "mimeType": GOOGLE_DRIVE_FOLDER_MIME_TYPE,
+        }
+        if parent_id:
+            metadata["parents"] = [parent_id]
+        try:
+            return (
+                self.service.files()
+                .create(
+                    body=metadata,
+                    fields="id,name,mimeType,parents,trashed,webViewLink",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+        except HttpError as exc:
+            logger.exception("Google Drive create_folder failed")
+            raise DriveLookupError(
+                "Google Drive 폴더 생성에 실패했습니다.",
+                detail=str(exc),
+            ) from exc
+
+    def upload_file_bytes(
+        self,
+        *,
+        parent_id: str,
+        file_name: str,
+        content: bytes,
+        mime_type: str,
+    ) -> dict:
+        media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
+        metadata = {"name": file_name, "parents": [parent_id]}
+        try:
+            return (
+                self.service.files()
+                .create(
+                    body=metadata,
+                    media_body=media,
+                    fields="id,name,mimeType,parents,trashed,webViewLink",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+        except HttpError as exc:
+            logger.exception("Google Drive upload_file_bytes failed")
+            raise DriveLookupError(
+                "Google Drive 파일 업로드에 실패했습니다.",
+                detail=str(exc),
+            ) from exc
+
+    def update_file_bytes(
+        self,
+        *,
+        file_id: str,
+        content: bytes,
+        mime_type: str,
+    ) -> dict:
+        media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
+        try:
+            return (
+                self.service.files()
+                .update(
+                    fileId=file_id,
+                    media_body=media,
+                    fields="id,name,mimeType,parents,trashed,webViewLink",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+        except HttpError as exc:
+            logger.exception("Google Drive update_file_bytes failed")
+            raise DriveLookupError(
+                "Google Drive 파일 업데이트에 실패했습니다.",
+                detail=str(exc),
+            ) from exc
+
     def download_file_bytes(self, file_id: str) -> bytes:
         try:
             request = self.service.files().get_media(fileId=file_id)
@@ -197,7 +349,7 @@ class GoogleDriveGateway(DriveGateway):
                 self.service.files()
                 .get(
                     fileId=file_id,
-                    fields="id,name,mimeType,parents,modifiedTime,size,md5Checksum,trashed",
+                    fields="id,name,mimeType,parents,modifiedTime,size,md5Checksum,trashed,webViewLink",
                     supportsAllDrives=True,
                 )
                 .execute()

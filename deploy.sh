@@ -13,6 +13,7 @@ DRIVE_CHANGES_JOB_NAME="${DRIVE_CHANGES_JOB_NAME:-medical-chatbot-sync-drive-cha
 FULL_SYNC_JOB_NAME="${FULL_SYNC_JOB_NAME:-medical-chatbot-sync-drive-full}"
 CALLBACK_JOBS_JOB_NAME="${CALLBACK_JOBS_JOB_NAME:-medical-chatbot-process-callback-jobs}"
 GEMINI_FILES_CLEANUP_JOB_NAME="${GEMINI_FILES_CLEANUP_JOB_NAME:-medical-chatbot-cleanup-gemini-files}"
+LEGACY_CHAT_LOG_EXPORT_JOB_NAME="${LEGACY_CHAT_LOG_EXPORT_JOB_NAME:-medical-chatbot-export-chat-logs}"
 CALLBACK_TASKS_QUEUE_NAME="${CALLBACK_TASKS_QUEUE_NAME:-medical-chatbot-callback-jobs}"
 PREWARM_TASKS_QUEUE_NAME="${PREWARM_TASKS_QUEUE_NAME:-medical-chatbot-prewarm}"
 WIKI_REBUILD_TASKS_QUEUE_NAME="${WIKI_REBUILD_TASKS_QUEUE_NAME:-medical-chatbot-wiki-rebuild}"
@@ -47,10 +48,14 @@ WIKI_REBUILD_TASKS_MIN_BACKOFF="${WIKI_REBUILD_TASKS_MIN_BACKOFF:-60s}"
 WIKI_REBUILD_TASKS_MAX_BACKOFF="${WIKI_REBUILD_TASKS_MAX_BACKOFF:-300s}"
 WIKI_REBUILD_TASKS_MAX_DOUBLINGS="${WIKI_REBUILD_TASKS_MAX_DOUBLINGS:-2}"
 WIKI_REBUILD_TASKS_MAX_RETRY_DURATION="${WIKI_REBUILD_TASKS_MAX_RETRY_DURATION:-1800s}"
+GEMINI_SECRET_NAME="${GEMINI_SECRET_NAME:-gemini-api-key}"
+ADMIN_DASHBOARD_ENABLED="${ADMIN_DASHBOARD_ENABLED:-false}"
+ADMIN_DASHBOARD_USERNAME="${ADMIN_DASHBOARD_USERNAME:-admin}"
+ADMIN_DASHBOARD_PASSWORD_SECRET_NAME="${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME:-admin-dashboard-password}"
 
 gcloud config set project "$PROJECT_ID"
 
-gcloud services enable cloudtasks.googleapis.com run.googleapis.com firestore.googleapis.com cloudscheduler.googleapis.com --project "$PROJECT_ID" >/dev/null
+gcloud services enable cloudtasks.googleapis.com run.googleapis.com firestore.googleapis.com cloudscheduler.googleapis.com secretmanager.googleapis.com --project "$PROJECT_ID" >/dev/null
 
 
 ensure_firestore_composite_indexes() {
@@ -111,6 +116,36 @@ configure_tasks_queue() {
     --max-retry-duration="$retry_duration" >/dev/null
 }
 
+grant_secret_access() {
+  local secret_name="$1"
+  if [[ -z "$secret_name" ]]; then
+    return
+  fi
+  gcloud secrets add-iam-policy-binding "$secret_name" \
+    --project "$PROJECT_ID" \
+    --member="serviceAccount:${RUN_SA}" \
+    --role="roles/secretmanager.secretAccessor" >/dev/null
+}
+
+require_secret_exists() {
+  local secret_name="$1"
+  if ! gcloud secrets describe "$secret_name" --project "$PROJECT_ID" >/dev/null 2>&1; then
+    echo "Required Secret Manager secret not found: ${secret_name}" >&2
+    echo "Create it before deploying with ADMIN_DASHBOARD_ENABLED=true." >&2
+    exit 1
+  fi
+}
+
+pause_scheduler_job_if_exists() {
+  local job_name="$1"
+  if gcloud scheduler jobs describe "$job_name" --project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
+    gcloud scheduler jobs pause "$job_name" \
+      --project "$PROJECT_ID" \
+      --location "$REGION" >/dev/null || true
+    echo "Paused legacy scheduler job: ${job_name}"
+  fi
+}
+
 if [[ "${ENSURE_FIRESTORE_INDEXES}" == "true" ]]; then
   ensure_firestore_composite_indexes
 fi
@@ -124,6 +159,16 @@ fi
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:${RUN_SA}" \
   --role="roles/cloudtasks.enqueuer" >/dev/null
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:${RUN_SA}" \
+  --role="roles/datastore.user" >/dev/null
+
+grant_secret_access "$GEMINI_SECRET_NAME"
+if [[ "$ADMIN_DASHBOARD_ENABLED" == "true" ]]; then
+  require_secret_exists "$ADMIN_DASHBOARD_PASSWORD_SECRET_NAME"
+  grant_secret_access "$ADMIN_DASHBOARD_PASSWORD_SECRET_NAME"
+fi
 
 # Required when Cloud Tasks uses CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL for OIDC.
 # Without this, create_task fails with iam.serviceAccounts.actAs PERMISSION_DENIED.
@@ -229,11 +274,14 @@ ENV_VARS+=",CALLBACK_PROCESSING_BUDGET_SECONDS=${CALLBACK_PROCESSING_BUDGET_SECO
 ENV_VARS+=",GEMINI_HTTP_TIMEOUT_MS=${GEMINI_HTTP_TIMEOUT_MS:-540000}"
 ENV_VARS+=",ADMIN_AUTH_MODE=oidc"
 ENV_VARS+=",ADMIN_OIDC_ALLOWED_EMAILS=${ALLOWED_EMAILS}"
+ENV_VARS+=",ADMIN_DASHBOARD_ENABLED=${ADMIN_DASHBOARD_ENABLED}"
+ENV_VARS+=",ADMIN_DASHBOARD_USERNAME=${ADMIN_DASHBOARD_USERNAME}"
 ENV_VARS+=",GEMINI_MODEL=gemini-3.5-flash"
 ENV_VARS+=",GEMINI_TEMPERATURE=0.1"
 ENV_VARS+=",GEMINI_MAX_OUTPUT_TOKENS=3072"
 ENV_VARS+=",GEMINI_THINKING_LEVEL=low"
 ENV_VARS+=",GEMINI_WIKI_MODEL=gemini-3.5-flash"
+ENV_VARS+=",GEMINI_WIKI_THINKING_LEVEL=medium"
 ENV_VARS+=",ROUTER_MODE=gemini"
 ENV_VARS+=",GEMINI_ROUTER_MODEL=gemini-3.5-flash"
 ENV_VARS+=",GEMINI_ROUTER_TEMPERATURE=0.0"
@@ -248,6 +296,11 @@ ENV_VARS+=",GEMINI_PARSING_TOP_K=1"
 ENV_VARS+=",GEMINI_PARSING_THINKING_LEVEL=minimal"
 ENV_VARS+=",LOG_LEVEL=INFO"
 
+SET_SECRETS="GEMINI_API_KEY=${GEMINI_SECRET_NAME}:latest"
+if [[ "$ADMIN_DASHBOARD_ENABLED" == "true" ]]; then
+  SET_SECRETS="${SET_SECRETS},ADMIN_DASHBOARD_PASSWORD=${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME}:latest"
+fi
+
 gcloud run deploy "$SERVICE_NAME" \
   --quiet \
   --source . \
@@ -259,7 +312,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --cpu 1 \
   --min-instances 1 \
   --set-env-vars "$ENV_VARS" \
-  --set-secrets GEMINI_API_KEY=gemini-api-key:latest
+  --set-secrets "$SET_SECRETS"
 
 SERVICE_URL=$(gcloud run services describe "$SERVICE_NAME" \
   --region "$REGION" \
@@ -327,6 +380,8 @@ upsert_scheduler_job \
   "${SERVICE_URL}/admin/cleanup-gemini-files" \
   "*/30 * * * *"
 
+pause_scheduler_job_if_exists "$LEGACY_CHAT_LOG_EXPORT_JOB_NAME"
+
 if [[ "$DEPLOY_FIRESTORE_INDEXES" == "true" ]]; then
   if command -v firebase >/dev/null 2>&1; then
     firebase deploy --only firestore:indexes --project "$PROJECT_ID"
@@ -345,6 +400,8 @@ echo "Callback Cloud Tasks queue: ${CALLBACK_TASKS_QUEUE_NAME}"
 echo "Callback queue rate/concurrency/attempts: ${CALLBACK_TASKS_MAX_DISPATCHES_PER_SECOND}/${CALLBACK_TASKS_MAX_CONCURRENT_DISPATCHES}/${CALLBACK_TASKS_MAX_ATTEMPTS}"
 echo "Prewarm Cloud Tasks queue: ${PREWARM_TASKS_QUEUE_NAME}"
 echo "Prewarm queue rate/concurrency/attempts: ${PREWARM_TASKS_MAX_DISPATCHES_PER_SECOND}/${PREWARM_TASKS_MAX_CONCURRENT_DISPATCHES}/${PREWARM_TASKS_MAX_ATTEMPTS}"
+echo "Admin dashboard enabled: ${ADMIN_DASHBOARD_ENABLED}"
+echo "Legacy chat log export scheduler paused if present: ${LEGACY_CHAT_LOG_EXPORT_JOB_NAME}"
 echo "Wiki rebuild worker mode: ${WIKI_REBUILD_WORKER_MODE}"
 echo "Wiki rebuild Cloud Tasks queue: ${WIKI_REBUILD_TASKS_QUEUE_NAME}"
 echo "Wiki rebuild queue rate/concurrency/attempts: ${WIKI_REBUILD_TASKS_MAX_DISPATCHES_PER_SECOND}/${WIKI_REBUILD_TASKS_MAX_CONCURRENT_DISPATCHES}/${WIKI_REBUILD_TASKS_MAX_ATTEMPTS}"

@@ -245,6 +245,9 @@ class FirestoreRuntimeTest(unittest.TestCase):
         text = response.json()["template"]["outputs"][0]["simpleText"]["text"]
         self.assertIn("문서 유형: 검사 결과", text)
         self.assertNotIn("lab_result", text)
+        assistant_logs = [log for log in self.repository.chat_logs.values() if log.role == "assistant"]
+        self.assertEqual(len(assistant_logs), 1)
+        self.assertEqual(assistant_logs[0].message, text)
 
     def test_admin_sync_patient_skips_unchanged_source_without_rebuilding_wiki(self) -> None:
         self.client.post("/admin/sync-drive/patient/P0001", headers={"x-admin-token": "admin-token"})
@@ -570,7 +573,11 @@ class FirestoreRuntimeTest(unittest.TestCase):
             )
             self.assertEqual(response.json(), {"version": "2.0", "useCallback": True})
 
-        self.assertEqual(len(self.repository.chat_logs), 2)
+        self.assertEqual(len(self.repository.chat_logs), 4)
+        self.assertEqual(
+            len([log for log in self.repository.chat_logs.values() if log.role == "assistant"]),
+            2,
+        )
         self.assertEqual(len(self.repository.callback_jobs), 2)
         self.assertEqual(len(self.callback_service.calls), 2)
 

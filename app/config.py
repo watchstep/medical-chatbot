@@ -17,6 +17,8 @@ WikiRebuildWorkerMode = Literal["inline", "cloud_tasks"]
 
 
 class Settings(BaseSettings):
+    app_env: str = "local"
+    app_name: str = "medical-chatbot"
     google_service_account_path: Path | None = None
     firestore_project_id: str | None = None
     firestore_database_id: str = "(default)"
@@ -28,6 +30,9 @@ class Settings(BaseSettings):
     admin_sync_token: str | None = None
     admin_oidc_audience: str | None = None
     admin_oidc_allowed_emails: str = ""
+    admin_dashboard_enabled: bool = False
+    admin_dashboard_username: str | None = None
+    admin_dashboard_password: str | None = None
 
 
     # Google Drive patient folder bootstrap
@@ -163,6 +168,8 @@ class Settings(BaseSettings):
     @field_validator(
         "admin_sync_token",
         "admin_oidc_audience",
+        "admin_dashboard_username",
+        "admin_dashboard_password",
         "google_drive_root_folder_id",
         "cloud_tasks_project_id",
         mode="before",
