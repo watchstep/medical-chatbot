@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     admin_dashboard_username: str | None = None
     admin_dashboard_password: str | None = None
 
+    # Temporary Kakao upload links
+    upload_token_ttl_minutes: int = Field(default=15, ge=1, le=120)
+    chat_attachment_ttl_minutes: int = Field(default=60, ge=1, le=1440)
+    max_upload_file_bytes: int = Field(default=20971520, ge=1, le=104857600)
+    upload_token_secret: str | None = None
+    upload_base_url: str | None = None
 
     # Google Drive patient folder bootstrap
     # Root ID is preferred because Drive folder names can be duplicated.
@@ -170,6 +176,8 @@ class Settings(BaseSettings):
         "admin_oidc_audience",
         "admin_dashboard_username",
         "admin_dashboard_password",
+        "upload_token_secret",
+        "upload_base_url",
         "google_drive_root_folder_id",
         "cloud_tasks_project_id",
         mode="before",

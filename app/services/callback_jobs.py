@@ -27,6 +27,10 @@ from app.services.gemini_files_qa import (
 )
 from app.services.kakao_callback import KakaoCallbackService
 from app.services.medical_wiki import KST, now_kst_iso
+from app.services.temporary_attachments import (
+    TEMPORARY_ATTACHMENT_SOURCE_LABEL,
+    TemporaryAttachmentService,
+)
 from app.services.timing import timing_done, timing_start
 
 logger = logging.getLogger(__name__)
@@ -34,6 +38,10 @@ logger = logging.getLogger(__name__)
 SYSTEM_PREPARING_MESSAGE = "관련 문서를 찾아 준비 중입니다.\n잠시 후 다시 시도해 주세요.🙇‍♂️"
 SAFE_FALLBACK_MESSAGE = "🔍 해당 내용은 제공된 의료 기록에서 확인하기 어렵습니다."
 OUT_OF_SCOPE_MESSAGE = "💬 의료 기록과 관련된 질문에만 답변을 드릴 수 있습니다."
+TEMPORARY_ATTACHMENT_UNSUPPORTED_MESSAGE = (
+    "현재는 최근 업로드한 파일 1개에 대한 질문만 답변할 수 있습니다.\n"
+    "여러 파일 비교, 이전 업로드 파일 선택, 기존 병원 기록과의 비교는 아직 지원하지 않습니다."
+)
 
 FIXED_INTENT_TO_STATUS = {
     "EMERGENCY": "emergency",
@@ -79,6 +87,7 @@ class CallbackJobProcessor:
     router_service: MedicalRouterService
     gemini_files_qa_service: GeminiFilesQaService | None
     kakao_callback_service: KakaoCallbackService
+    temporary_attachment_service: TemporaryAttachmentService | None = None
 
     def process_job(self, job_id: str) -> CallbackJobProcessResult:
         callback_started_at = timing_start(logger, "callback_job.start", job_id=job_id)
@@ -157,6 +166,51 @@ class CallbackJobProcessor:
         try:
             question, prior_context, wiki_index = self._load_job_context(job=job, job_id=job_id)
             self._ensure_processing_budget(deadline, reserve_seconds=self.settings.kakao_callback_timeout_seconds + 1.0)
+
+            if job.answer_route == "temporary_attachment":
+                if self._is_temporary_attachment_unsupported(question):
+                    answer_text = TEMPORARY_ATTACHMENT_UNSUPPORTED_MESSAGE
+                    text_type = "system"
+                    self._append_session_turn(
+                        patient_id=job.patient_id,
+                        kakao_user_id_hash=job.kakao_user_id_hash,
+                        question=question,
+                        answer_status="cannot_verify",
+                        text_type=text_type,
+                    )
+                else:
+                    answer = self._build_answer_from_temporary_attachment(
+                        job=job,
+                        job_id=job_id,
+                        question=question,
+                        prior_context=prior_context,
+                        deadline=deadline,
+                    )
+                    answer_source_id = job.attachment_id if answer.status == "ok" else ""
+                    answer_text = self._render_answer(
+                        patient_id=job.patient_id,
+                        answer=answer,
+                        intent="OK",
+                        answer_source_id=answer_source_id,
+                        job_id=job_id,
+                        temporary_source_label=TEMPORARY_ATTACHMENT_SOURCE_LABEL,
+                    )
+                    text_type = "answer"
+                    self._append_session_turn(
+                        patient_id=job.patient_id,
+                        kakao_user_id_hash=job.kakao_user_id_hash,
+                        question=question,
+                        answer_status=answer.status,
+                        text_type=text_type,
+                    )
+                self._ensure_processing_budget(deadline, reserve_seconds=self.settings.kakao_callback_timeout_seconds + 0.5)
+                return self._send_callback(
+                    job=job,
+                    lock_owner=lock_owner,
+                    answer_text=answer_text,
+                    text_type=text_type,
+                    failure=None,
+                )
 
             router_started_at = timing_start(logger, "router.start", job_id=job_id, patient_id=job.patient_id)
             try:
@@ -404,6 +458,99 @@ class CallbackJobProcessor:
         )
         return answer
 
+    def _build_answer_from_temporary_attachment(
+        self,
+        *,
+        job: KakaoCallbackJob,
+        job_id: str,
+        question: str,
+        prior_context: str,
+        deadline: float,
+    ) -> FinalQaAnswer:
+        if self.gemini_files_qa_service is None:
+            raise GeminiFilesQaError("Gemini Files QA service is not configured")
+        if self.temporary_attachment_service is None:
+            raise GeminiFilesQaError("Temporary attachment service is not configured")
+
+        router_started_at = timing_start(logger, "temporary_router.start", job_id=job_id, patient_id=job.patient_id)
+        try:
+            selection = self.router_service.select_source(
+                question=question,
+                prior_context=prior_context,
+                wiki_index=MedicalWikiIndex(patient_id=job.patient_id),
+            )
+        except Exception:
+            timing_done(
+                logger,
+                "temporary_router.done",
+                router_started_at,
+                status="error",
+                job_id=job_id,
+                patient_id=job.patient_id,
+                error_code="ROUTER_FAILED",
+            )
+            raise
+        timing_done(
+            logger,
+            "temporary_router.done",
+            router_started_at,
+            status=selection.intent,
+            job_id=job_id,
+            patient_id=job.patient_id,
+            intent=selection.intent,
+        )
+        if selection.intent in FIXED_INTENT_TO_STATUS:
+            return FinalQaAnswer(status=FIXED_INTENT_TO_STATUS[selection.intent])
+
+        attachment = self.temporary_attachment_service.get_current_attachment(
+            patient_id=job.patient_id,
+            kakao_user_id_hash=job.kakao_user_id_hash,
+        )
+        if attachment is None or attachment.attachment_id != job.attachment_id:
+            raise GeminiFileNotReadyError("temporary attachment is no longer available")
+
+        self._ensure_processing_budget(deadline, reserve_seconds=self.settings.kakao_callback_timeout_seconds + 1.0)
+        prepared_file = self.temporary_attachment_service.prepare_attachment_file(attachment=attachment)
+
+        self._ensure_processing_budget(deadline, reserve_seconds=self.settings.kakao_callback_timeout_seconds + 1.0)
+        final_qa_started_at = timing_start(
+            logger,
+            "temporary_final_qa.start",
+            job_id=job_id,
+            patient_id=job.patient_id,
+            source_id=attachment.attachment_id,
+        )
+        try:
+            answer = self.gemini_files_qa_service.answer_question(
+                patient_id=job.patient_id,
+                question=question,
+                prior_context=prior_context,
+                prepared_file=prepared_file,
+                intent="OK",
+            )
+        except Exception:
+            timing_done(
+                logger,
+                "temporary_final_qa.done",
+                final_qa_started_at,
+                status="error",
+                job_id=job_id,
+                patient_id=job.patient_id,
+                source_id=attachment.attachment_id,
+                error_code="FINAL_QA_FAILED",
+            )
+            raise
+        timing_done(
+            logger,
+            "temporary_final_qa.done",
+            final_qa_started_at,
+            status=answer.status,
+            job_id=job_id,
+            patient_id=job.patient_id,
+            source_id=attachment.attachment_id,
+        )
+        return answer
+
     def _render_answer(
         self,
         *,
@@ -412,18 +559,22 @@ class CallbackJobProcessor:
         intent: MedicalQuestionIntent,
         answer_source_id: str,
         job_id: str,
+        temporary_source_label: str = "",
     ) -> str:
         render_started_at = timing_start(logger, "render.start", job_id=job_id, patient_id=patient_id, source_id=answer_source_id)
         try:
             if self.gemini_files_qa_service is None:
                 answer_text = self._fixed_status_text(answer)
             else:
-                answer_text = self.gemini_files_qa_service.render_answer(
-                    patient_id=patient_id,
-                    answer=answer,
-                    intent=intent,
-                    selected_source_id=answer_source_id,
-                )
+                render_kwargs = {
+                    "patient_id": patient_id,
+                    "answer": answer,
+                    "intent": intent,
+                    "selected_source_id": answer_source_id,
+                }
+                if temporary_source_label:
+                    render_kwargs["temporary_source_label"] = temporary_source_label
+                answer_text = self.gemini_files_qa_service.render_answer(**render_kwargs)
         except Exception:
             timing_done(
                 logger,
@@ -670,6 +821,15 @@ class CallbackJobProcessor:
 
     def _safe_error_message(self, message: str) -> str:
         return " ".join(str(message).split())[:300]
+
+    def _is_temporary_attachment_unsupported(self, question: str) -> bool:
+        normalized = question.replace(" ", "").casefold()
+        comparison_terms = ["비교", "차이", "같아", "다른", "대조"]
+        multi_terms = ["여러파일", "두파일", "2개파일", "파일들", "이전파일", "전파일", "기존기록", "병원기록", "지난검사"]
+        return any(term in normalized for term in multi_terms) or (
+            any(term in normalized for term in comparison_terms)
+            and any(term in normalized for term in ["파일", "기록", "검사"])
+        )
 
     def _is_expired(self, value: str) -> bool:
         if not value:

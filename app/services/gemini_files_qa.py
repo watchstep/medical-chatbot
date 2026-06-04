@@ -81,6 +81,7 @@ class PreparedGeminiFile:
     uri: str
     mime_type: str
     file_object: Any
+    source_kind: str = "medical_source"
 
 
 class GeminiFilesGateway:
@@ -1228,6 +1229,7 @@ class GeminiFilesQaService:
             answer=answer,
             expected_source_id=source_id,
             intent=intent,
+            expected_source_kind=prepared_file.source_kind if prepared_file is not None else "medical_source",
         )
         return answer
 
@@ -1238,6 +1240,7 @@ class GeminiFilesQaService:
         answer: FinalQaAnswer,
         intent: MedicalQuestionIntent = "OK",
         selected_source_id: str = "",
+        temporary_source_label: str = "",
     ) -> str:
         fixed_messages = {
             "emergency": "🧑‍⚕️ 증상이 지속된다면 의료기관을 찾아 전문의와 상의해 보시길 권합니다.",
@@ -1263,14 +1266,17 @@ class GeminiFilesQaService:
 
         source_lines: list[str] = []
         for source_id in self._ordered_used_source_ids(answer.used_source_ids):
-            page = self.repository.get_wiki_page_by_source(patient_id, source_id)
-            source_lines.append(
-                format_medical_source_display_name(
-                    category=page.frontmatter.category if page is not None else "unknown",
-                    date=page.frontmatter.date if page is not None else "",
-                    page_count=page.frontmatter.page_count if page is not None else None,
+            if temporary_source_label and source_id == selected_source_id:
+                source_lines.append(temporary_source_label)
+            else:
+                page = self.repository.get_wiki_page_by_source(patient_id, source_id)
+                source_lines.append(
+                    format_medical_source_display_name(
+                        category=page.frontmatter.category if page is not None else "unknown",
+                        date=page.frontmatter.date if page is not None else "",
+                        page_count=page.frontmatter.page_count if page is not None else None,
+                    )
                 )
-            )
 
         if not source_lines:
             return fixed_messages["cannot_verify"]
@@ -1360,6 +1366,7 @@ class GeminiFilesQaService:
         answer: FinalQaAnswer,
         expected_source_id: str,
         intent: MedicalQuestionIntent,
+        expected_source_kind: str = "medical_source",
     ) -> None:
         if answer.status != "ok":
             if answer.used_source_ids:
@@ -1370,6 +1377,9 @@ class GeminiFilesQaService:
 
         if intent != "OK":
             raise GeminiFilesQaError("Final QA는 OK intent만 처리할 수 있습니다.")
+
+        if expected_source_id and expected_source_id in answer.kakaotalk_render:
+            raise GeminiFilesQaError("답변 본문에 내부 source 식별자가 포함되었습니다.")
 
         if not expected_source_id and answer.used_source_ids:
             raise GeminiFilesQaError("source 없는 답변에 source가 포함되었습니다.")
@@ -1382,6 +1392,8 @@ class GeminiFilesQaService:
         for source_id in answer.used_source_ids:
             if source_id not in allowed_source_ids:
                 raise GeminiFilesQaError("답변 source가 최종 QA에 전달된 문서와 일치하지 않습니다.")
+            if expected_source_kind == "temporary_attachment":
+                continue
             self._validate_source(patient_id=patient_id, source_id=source_id)
 
     def _validate_source(self, *, patient_id: str, source_id: str) -> MedicalSource:

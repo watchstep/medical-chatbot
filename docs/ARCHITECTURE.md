@@ -10,6 +10,7 @@
 - Firestore는 환자 인증, 원본 source registry, Medical LLM Wiki page, Medical LLM Wiki index, Gemini Files API runtime 상태, 세션, 사용자 질문/assistant 답변 chat log, 카카오 callback job 상태, lock, retry 상태를 관리하는 운영 DB로 사용한다.
 - Gemini Files API는 선택된 원본 파일을 Gemini 최종 QA 호출에 전달하기 위한 임시 파일 참조 계층으로 사용한다.
 - Gemini Files API에 업로드된 파일은 원본 저장소가 아니라 runtime cache로 취급하며, 용량 한도와 만료 정책을 고려해 주기적으로 cleanup한다.
+- 카카오 사용자가 직접 올린 PDF/이미지는 Google Drive source가 아니며, 인증된 카카오 세션의 최근 temporary attachment 1개로만 관리한다.
 - 인증 성공, 이미 인증된 시작 블록 진입, 의료 기록 조회 시점에는 사용자 응답을 지연시키지 않고 Cloud Tasks 기반 pre-warm job을 생성해 가장 가능성이 높은 source를 미리 Files API에 준비한다.
 - Gemini Router는 현재 질문이 차단 대상인지 판단하고, 차단 대상이 아니면 `OK`로 처리한 뒤 현재 인증 환자의 `medical_wiki_index`와 `medical_wiki_pages` catalog를 보고 `selected` 또는 `insufficient`와 `primary_source_id`를 결정한다.
 - 최종 QA의 기준 근거는 `medical_wiki_pages`, `medical_wiki_index`, Markdown 파싱본이 아니라, Gemini Files API로 전달된 Google Drive 원본 파일 전체다.
@@ -57,6 +58,7 @@ Google Drive 원본 파일
 → 인증 성공 또는 의료 기록 조회 시 Cloud Tasks로 latest source pre-warm job 생성
 → Pre-warm Worker가 필요한 경우 선택 source를 Gemini Files API에 미리 준비
 → 사용자 질문 발생
+→ 질문이 최근 업로드 파일을 가리키면 Router source 선택 전에 active attachment 기준으로 Final QA 처리
 → 현재 인증 환자의 medical_wiki_index를 Router가 먼저 읽음
 → 필요 시 관련 medical_wiki_pages를 참고
 → Gemini Router가 차단 intent 또는 OK를 판단하고, OK이면 selected 또는 insufficient를 결정
@@ -120,6 +122,7 @@ prewarm jobs
 - Router에 `medical_sources.source_ref`, `medical_source_runtime.gemini_file`, lock, retry, Drive index 값을 전달하지 않는다.
 - Router 결과는 항상 백엔드에서 현재 인증 환자 source인지 검증한다.
 - 최종 Gemini 호출에는 현재 인증 환자의 선택된 원본 파일만 `contents`에 포함한다.
+- 임시 업로드 질문에서는 현재 인증 환자와 카카오 세션에 바인딩된 active attachment만 `contents`에 포함한다.
 - 다른 환자의 원본 파일, source_id, Gemini Files API file_name, file_uri를 사용하지 않는다.
 - Google Drive ID, Gemini file_name, 내부 source_id, 원본 파일명을 카카오톡 응답에 노출하지 않는다.
 
@@ -135,6 +138,8 @@ prewarm jobs
 | Firestore `medical_wiki_index` | 환자별 wiki page catalog. Router가 먼저 읽는 index.md 역할 |
 | Firestore `medical_wiki_logs` | wiki ingest, rebuild, index compile, 실패 이벤트 기록 |
 | Firestore `medical_source_runtime` | Gemini Files API 상태, sync 상태, lock, lease, retry, 실패 정보 관리 |
+| Firestore `active_attachments` | 인증된 카카오 세션의 최근 임시 업로드 파일 1개 관리. Google Drive source와 분리 |
+| Firestore `upload_tokens` | `/upload/{token}` 접근을 위한 one-use token 상태 관리 |
 | Firestore `gemini_file_prewarm_jobs` | pre-warm 작업 상태, idempotency, lock, retry, skip 또는 실패 정보 관리 |
 | Gemini Files API | 선택된 원본 파일을 Gemini가 읽을 수 있게 하는 임시 파일 참조 계층 |
 | Gemini Files Cleanup Worker | Files API runtime cache 사용량을 계산하고 soft, target, hard limit 기준으로 오래된 cache를 정리 |

@@ -119,6 +119,8 @@ DRIVE_SYNC_GLOBAL_LOCK_TIMEOUT
 - 실패 시 원본 파일을 삭제하지 않는다.
 - 실패한 source는 document pack에서 제외하거나 안전 실패 메시지로 처리한다.
 - 실패한 wiki page 생성은 retry_count 정책에 따라 재시도한다.
+- 업로드 token URL, Gemini file_name, file_uri, 원본 파일명은 chat log, 카카오 응답, 관리자 대시보드에 노출하지 않는다.
+- 업로드 링크 발급 assistant log에는 실제 URL 대신 고정 문구만 저장한다.
 
 ## 직접 PDF Parsing 정책
 

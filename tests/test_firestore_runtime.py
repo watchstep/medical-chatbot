@@ -200,9 +200,36 @@ class FirestoreRuntimeTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
+        text = response.json()["template"]["outputs"][0]["simpleText"]["text"]
+        self.assertIn('별도의 PDF나 이미지 파일 질문하고 싶다면 [📎 파일 업로드]을 누르거나 "파일 업로드"라고 입력해 주세요.', text)
         mapping = self.repository.get_kakao_mapping(hash_kakao_user_id("kakao-user-1"))
         self.assertIsNotNone(mapping)
         self.assertIsNone(self.repository.get_kakao_mapping("kakao-user-1"))
+
+    def test_authenticated_start_message_mentions_file_upload(self) -> None:
+        self.client.post(
+            "/kakao/auth",
+            json={
+                "userRequest": {
+                    "user": {"id": "kakao-user-authenticated-start"},
+                    "utterance": "인증 손창선 19461230",
+                }
+            },
+        )
+
+        response = self.client.post(
+            "/kakao/auth",
+            json={
+                "userRequest": {
+                    "user": {"id": "kakao-user-authenticated-start"},
+                    "utterance": "시작",
+                }
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        text = response.json()["template"]["outputs"][0]["simpleText"]["text"]
+        self.assertIn('별도의 PDF나 이미지 파일 질문하고 싶다면 [📎 파일 업로드]을 누르거나 "파일 업로드"라고 입력해 주세요.', text)
 
     def test_admin_sync_patient_builds_source_runtime_and_wiki_index(self) -> None:
         response = self.client.post(

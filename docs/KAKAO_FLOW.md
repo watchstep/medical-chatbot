@@ -94,6 +94,7 @@ kakao_user_id 추출
 → patients/{patient_id} 조회
 → log_id 생성
 → patients/{patient_id}/chat_logs/{log_id} 생성, job_id = null
+→ "파일 업로드", "PDF 업로드", "이미지 업로드" 명령이면 upload token 생성 후 /upload/{token} 링크를 즉시 반환
 → 의료 기록 조회 intent이면 의료 기록 안내를 assistant/system chat log로 저장하고 즉시 반환하며 pre-warm job 생성을 best-effort로 시도
 → drive_sync_state.sync_status == BOOTSTRAP_REQUIRED 이면 시스템 준비 중 메시지 즉시 반환
 → callback_url 확인
@@ -110,6 +111,7 @@ kakao_user_id 추출
 
 - `chat_logs`는 callback job 완료 후가 아니라 인증된 `/kakao/chat` 요청 수신 직후 저장한다.
 - callback 전송에 성공한 최종 assistant 답변은 `ANSWER_{job_id}` chat log로 저장한다.
+- 업로드 링크 발급 응답의 assistant chat log에는 실제 token URL을 저장하지 않고 고정 문구만 저장한다.
 - callback 전송 실패 또는 retry 예정 상태에서는 assistant 답변을 전송 완료로 저장하지 않는다.
 - 의료 기록 조회 안내, callback 불가 안내처럼 인증된 `/kakao/chat` 요청에 대한 즉시 응답은 assistant/system chat log로 저장한다.
 - callback job을 만들 수 없는 즉시 응답 경로에서는 `chat_logs.job_id`가 `null`일 수 있다.
@@ -125,6 +127,9 @@ job_id 기준 callback job 시작
 → kakao_callback_jobs/{job_id}.status = PROCESSING
 → chat_sessions에서 최근 3턴 조회
 → 최근 사용자 질문 1~2개를 prior_context로 요약
+→ 질문이 "방금 파일", "이 파일", "업로드한 파일", "첨부한 파일", "이 PDF", "이 이미지"처럼 최근 업로드 파일을 가리키면 active attachment를 우선 확인
+→ active attachment가 유효하면 Router source 선택 없이 해당 Gemini Files API file object로 Final QA 호출
+→ 임시 업로드와 Google Drive 기록 비교, 여러 업로드 파일 비교, 이전 업로드 파일 선택은 MVP에서 지원하지 않음
 → Router에는 현재 질문, prior_context, medical_wiki_index, 필요한 source_summary page만 전달
 → Gemini Router가 intent와 selection_status, 필요한 경우 primary_source_id를 반환
 → Router intent가 EMERGENCY, PRIVACY_BLOCK, COST_BLOCK, OUT_OF_SCOPE이면 Final QA를 호출하지 않음

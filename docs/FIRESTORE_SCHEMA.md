@@ -22,6 +22,8 @@ patients/{patient_id}/medical_source_runtime/{source_id}
 
 patients/{patient_id}/chat_sessions/{kakao_user_id_hash}
 patients/{patient_id}/chat_logs/{log_id}
+patients/{patient_id}/active_attachments/{kakao_user_id_hash}
+upload_tokens/{token_id}
 kakao_callback_jobs/{job_id}
 gemini_file_prewarm_jobs/{job_id}
 ```
@@ -49,6 +51,12 @@ chat_sessions/{kakao_user_id_hash}
 
 chat_logs/{log_id}
 = 인증된 사용자가 `/kakao/chat`에 입력한 원문 메시지 로그
+
+active_attachments/{kakao_user_id_hash}
+= 인증된 카카오 세션의 최근 임시 업로드 파일 1개. Google Drive source와 섞지 않음
+
+upload_tokens/{token_id}
+= `/upload/{token}` 접근을 위한 stateful one-use token 상태
 
 kakao_callback_jobs/{job_id}
 = 카카오 callback 기반 비동기 응답 작업 상태, retry, 실패 정보
@@ -256,6 +264,65 @@ UNSUPPORTED
 - `drive_modified_at`은 의료 문서의 검사일, 진료일, 발급일이 아니다.
 - `original_filename`, `drive_file_id`, `drive_folder_id`는 내부 운영용이며 사용자에게 노출하지 않는다.
 - 지원하지 않는 파일 형식은 `UNSUPPORTED`로 기록하고 원본을 삭제하지 않는다.
+
+## Temporary upload attachments
+
+경로:
+
+```text
+upload_tokens/{token_id}
+patients/{patient_id}/active_attachments/{kakao_user_id_hash}
+```
+
+`upload_tokens/{token_id}` 예시:
+
+```json
+{
+  "token_id": "UPTOK_...",
+  "patient_id": "P0001",
+  "kakao_user_id_hash": "sha256:...",
+  "status": "PENDING",
+  "expires_at": "2026-06-04T16:00:00+09:00",
+  "used_at": "",
+  "created_at": "2026-06-04T15:45:00+09:00",
+  "updated_at": "2026-06-04T15:45:00+09:00"
+}
+```
+
+`patients/{patient_id}/active_attachments/{kakao_user_id_hash}` 예시:
+
+```json
+{
+  "attachment_id": "ATT_...",
+  "upload_token_id": "UPTOK_...",
+  "patient_id": "P0001",
+  "kakao_user_id_hash": "sha256:...",
+  "gemini_file": {
+    "file_name": "internal-only",
+    "uri": "internal-only",
+    "mime_type": "image/jpeg",
+    "state": "ACTIVE",
+    "expiration_time": "2026-06-06T15:45:00Z",
+    "uploaded_at": "2026-06-04T15:45:00+09:00",
+    "last_checked_at": "2026-06-04T15:45:00+09:00"
+  },
+  "mime_type": "image/jpeg",
+  "file_size_bytes": 8420000,
+  "status": "ACTIVE",
+  "expires_at": "2026-06-04T16:45:00+09:00",
+  "created_at": "2026-06-04T15:45:00+09:00",
+  "updated_at": "2026-06-04T15:45:00+09:00"
+}
+```
+
+정책:
+
+- 업로드 token은 환자 ID와 `kakao_user_id_hash`에 바인딩하며 성공한 POST에서만 `USED` 처리한다.
+- active attachment는 환자 + 카카오 세션당 최근 1개만 유지한다.
+- 임시 업로드 파일은 Google Drive source of truth가 아니며 `medical_sources`, `medical_wiki_pages`, `medical_wiki_index`에 저장하지 않는다.
+- 저장 필드는 업로드 token ID, Gemini Files runtime 참조, MIME, 크기, 만료시각, 상태로 제한한다.
+- 이미 `USED` 처리된 token의 재전송은 active attachment의 `upload_token_id`가 같은 경우에만 완료 상태로 간주한다.
+- 원본 파일명, 파일 내용, Drive ID, Gemini file URI/name은 사용자 응답과 chat log에 노출하지 않는다.
 
 ## 4. medical_wiki_pages
 

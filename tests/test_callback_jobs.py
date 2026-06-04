@@ -84,9 +84,11 @@ except ImportError:
 from app.config import Settings
 from app.repositories import InMemoryMedicalRepository
 from app.schemas import (
+    ActiveAttachment,
     ChatLog,
     ChatSession,
     FinalQaAnswer,
+    GeminiFileRuntime,
     KakaoCallbackJob,
     MedicalSource,
     MedicalSourceRuntime,
@@ -233,8 +235,9 @@ class FakeGeminiFilesQaService:
         answer: FinalQaAnswer,
         intent: str = "OK",
         selected_source_id: str = "",
+        temporary_source_label: str = "",
     ) -> str:
-        del intent, selected_source_id
+        del intent, selected_source_id, temporary_source_label
         del patient_id
         self.calls.append("render")
         fixed_messages = {
@@ -258,6 +261,32 @@ class FakeKakaoCallbackService:
         if self.fail:
             raise RuntimeError("callback boom")
         self.calls.append({"callback_url": callback_url, "text": text})
+
+
+class FakeTemporaryAttachmentService:
+    def __init__(self) -> None:
+        self.attachment = ActiveAttachment(
+            attachment_id="ATT_TEST",
+            patient_id="P0001",
+            kakao_user_id_hash="hash-user",
+            gemini_file=GeminiFileRuntime(file_name="files/temp", state="ACTIVE"),
+            expires_at=(datetime.now(KST) + timedelta(minutes=30)).isoformat(),
+        )
+
+    def get_current_attachment(self, *, patient_id: str, kakao_user_id_hash: str) -> ActiveAttachment | None:
+        if patient_id == self.attachment.patient_id and kakao_user_id_hash == self.attachment.kakao_user_id_hash:
+            return self.attachment
+        return None
+
+    def prepare_attachment_file(self, *, attachment: ActiveAttachment) -> PreparedGeminiFile:
+        return PreparedGeminiFile(
+            source_id=attachment.attachment_id,
+            file_name=attachment.gemini_file.file_name,
+            uri="",
+            mime_type="application/pdf",
+            file_object=SimpleNamespace(name=attachment.gemini_file.file_name),
+            source_kind="temporary_attachment",
+        )
 
 
 class CallbackJobProcessorTest(unittest.TestCase):
@@ -322,6 +351,7 @@ class CallbackJobProcessorTest(unittest.TestCase):
         )
         self.qa_service = FakeGeminiFilesQaService()
         self.callback_service = FakeKakaoCallbackService()
+        self.temporary_attachment_service = FakeTemporaryAttachmentService()
         self.processor = CallbackJobProcessor(
             settings=self.settings,
             repository=self.repository,
@@ -331,6 +361,7 @@ class CallbackJobProcessorTest(unittest.TestCase):
             ),
             gemini_files_qa_service=self.qa_service,  # type: ignore[arg-type]
             kakao_callback_service=self.callback_service,  # type: ignore[arg-type]
+            temporary_attachment_service=self.temporary_attachment_service,  # type: ignore[arg-type]
         )
 
     def _create_job(
@@ -339,6 +370,8 @@ class CallbackJobProcessorTest(unittest.TestCase):
         status: str = "PENDING",
         expires_delta_minutes: int = 10,
         message: str = "검사 결과 알려줘",
+        answer_route: str = "drive",
+        attachment_id: str = "",
     ) -> KakaoCallbackJob:
         log = ChatLog(
             log_id="LOG_TEST",
@@ -355,6 +388,8 @@ class CallbackJobProcessorTest(unittest.TestCase):
             chat_log_id=log.log_id,
             status=status,  # type: ignore[arg-type]
             callback_url="https://callback.example.test",
+            answer_route=answer_route,  # type: ignore[arg-type]
+            attachment_id=attachment_id,
             max_attempts=3,
             idempotency_key="P0001:LOG_TEST",
             created_at=now_kst_iso(),
@@ -562,6 +597,19 @@ class CallbackJobProcessorTest(unittest.TestCase):
         self.assertEqual(stored.status, "FAILED")
         self.assertEqual(stored.retry_count, 1)
         self.assertIsNotNone(stored.next_run_at)
+
+    def test_temporary_attachment_job_uses_snapshot_attachment_without_drive_prepare(self) -> None:
+        self._create_job(
+            message="이 파일 설명해줘",
+            answer_route="temporary_attachment",
+            attachment_id="ATT_TEST",
+        )
+
+        result = self.processor.process_job("JOB_TEST")
+
+        self.assertEqual(result.status, "CALLBACK_SENT")
+        self.assertEqual(self.qa_service.calls, ["answer", "render"])
+        self.assertIn("문서에서 관련 내용이 확인됩니다", self.callback_service.calls[0]["text"])
 
 
 if __name__ == "__main__":

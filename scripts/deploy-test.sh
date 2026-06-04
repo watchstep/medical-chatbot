@@ -64,6 +64,10 @@ load_optional_env_from_dotenv() {
 load_optional_env_from_dotenv "ADMIN_DASHBOARD_ENABLED"
 load_optional_env_from_dotenv "ADMIN_DASHBOARD_USERNAME"
 load_optional_env_from_dotenv "ADMIN_DASHBOARD_PASSWORD_SECRET_NAME"
+load_optional_env_from_dotenv "UPLOAD_TOKEN_SECRET_NAME"
+load_optional_env_from_dotenv "UPLOAD_TOKEN_TTL_MINUTES"
+load_optional_env_from_dotenv "CHAT_ATTACHMENT_TTL_MINUTES"
+load_optional_env_from_dotenv "MAX_UPLOAD_FILE_BYTES"
 
 ADMIN_DASHBOARD_PASSWORD_VALUE="${ADMIN_DASHBOARD_PASSWORD:-}"
 if [[ -z "${ADMIN_DASHBOARD_PASSWORD_VALUE}" ]]; then
@@ -83,6 +87,25 @@ if [[ -n "${ADMIN_DASHBOARD_PASSWORD_VALUE}" ]]; then
     --project "${PROJECT_ID}" \
     --data-file=- >/dev/null
   echo "Updated admin dashboard password secret: ${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME}"
+fi
+
+UPLOAD_TOKEN_SECRET_VALUE="${UPLOAD_TOKEN_SECRET:-}"
+if [[ -z "${UPLOAD_TOKEN_SECRET_VALUE}" ]]; then
+  UPLOAD_TOKEN_SECRET_VALUE="$(read_dotenv_value "UPLOAD_TOKEN_SECRET")"
+fi
+
+export UPLOAD_TOKEN_SECRET_NAME="${UPLOAD_TOKEN_SECRET_NAME:-upload-token-secret-test}"
+if [[ -n "${UPLOAD_TOKEN_SECRET_VALUE}" ]]; then
+  gcloud services enable secretmanager.googleapis.com --project "${PROJECT_ID}" >/dev/null
+  if ! gcloud secrets describe "${UPLOAD_TOKEN_SECRET_NAME}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+    gcloud secrets create "${UPLOAD_TOKEN_SECRET_NAME}" \
+      --project "${PROJECT_ID}" \
+      --replication-policy="automatic" >/dev/null
+  fi
+  printf "%s" "${UPLOAD_TOKEN_SECRET_VALUE}" | gcloud secrets versions add "${UPLOAD_TOKEN_SECRET_NAME}" \
+    --project "${PROJECT_ID}" \
+    --data-file=- >/dev/null
+  echo "Updated upload token secret: ${UPLOAD_TOKEN_SECRET_NAME}"
 fi
 
 exec ./deploy-test.sh

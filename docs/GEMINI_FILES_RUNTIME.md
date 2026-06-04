@@ -62,6 +62,7 @@ usage >= hard limit
 
 - `UPLOADING` 또는 `PROCESSING` 상태의 file은 일반 cleanup에서 삭제하지 않는다. 진행 중인 upload 또는 polling을 방해할 수 있다.
 - cleanup은 `medical_source_runtime.gemini_file` cache 상태만 비운다. `medical_sources`, `medical_wiki_pages`, `medical_wiki_index`는 삭제하지 않는다.
+- 만료된 temporary attachment는 `active_attachments`에서 삭제하고 해당 Gemini Files API file을 best-effort로 삭제한다. Google Drive source와 Medical Wiki 계층에는 영향을 주지 않는다.
 - cleanup 후에도 `runtime.sync.status`와 `runtime.wiki_sync.status`가 READY라면 Router 후보로 남을 수 있다. 실제 질문 시 필요한 경우 기존 lazy `prepare_file()`이 다시 upload한다.
 - cleanup 실패는 사용자에게 노출하지 않는다. 로그와 운영 결과 payload에만 기록한다.
 - Drive 원본 파일은 cleanup 대상이 아니다.

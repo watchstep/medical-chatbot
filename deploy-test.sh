@@ -120,9 +120,14 @@ SESSION_TTL_MINUTES="${SESSION_TTL_MINUTES:-1440}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
 GEMINI_SECRET_NAME="${GEMINI_SECRET_NAME:-gemini-api-key}"
+UPLOAD_TOKEN_SECRET_NAME="${UPLOAD_TOKEN_SECRET_NAME:-upload-token-secret-test}"
 ADMIN_DASHBOARD_ENABLED="${ADMIN_DASHBOARD_ENABLED:-false}"
 ADMIN_DASHBOARD_USERNAME="${ADMIN_DASHBOARD_USERNAME:-admin}"
 ADMIN_DASHBOARD_PASSWORD_SECRET_NAME="${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME:-admin-dashboard-password}"
+
+UPLOAD_TOKEN_TTL_MINUTES="${UPLOAD_TOKEN_TTL_MINUTES:-15}"
+CHAT_ATTACHMENT_TTL_MINUTES="${CHAT_ATTACHMENT_TTL_MINUTES:-60}"
+MAX_UPLOAD_FILE_BYTES="${MAX_UPLOAD_FILE_BYTES:-20971520}"
 
 if [[ -z "${GOOGLE_DRIVE_ROOT_FOLDER_ID}" ]]; then
   echo "WARNING: GOOGLE_DRIVE_ROOT_FOLDER_ID is empty." >&2
@@ -155,6 +160,18 @@ ensure_firestore_composite_indexes() {
     --database "${FIRESTORE_DATABASE_ID}" \
     --collection-group "kakao_callback_jobs" \
     --query-scope "COLLECTION" \
+    --field-config "field-path=status,order=ascending" \
+    --field-config "field-path=expires_at,order=ascending" \
+    --async >/dev/null 2>&1 || true
+
+  # Required by temporary upload attachment cleanup:
+  # collection_group(active_attachments) where(status == ACTIVE)
+  # + where(expires_at <= now) + order_by(expires_at).
+  gcloud firestore indexes composite create \
+    --project "${PROJECT_ID}" \
+    --database "${FIRESTORE_DATABASE_ID}" \
+    --collection-group "active_attachments" \
+    --query-scope "COLLECTION_GROUP" \
     --field-config "field-path=status,order=ascending" \
     --field-config "field-path=expires_at,order=ascending" \
     --async >/dev/null 2>&1 || true
@@ -204,6 +221,32 @@ grant_secret_access() {
     --role="roles/secretmanager.secretAccessor" >/dev/null
 }
 
+require_secret_exists() {
+  local secret_name="$1"
+  if ! gcloud secrets describe "${secret_name}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+    echo "Required Secret Manager secret not found: ${secret_name}" >&2
+    echo "Create it or run scripts/deploy-test.sh with UPLOAD_TOKEN_SECRET set." >&2
+    exit 1
+  fi
+}
+
+upsert_secret_value_if_present() {
+  local secret_name="$1"
+  local secret_value="$2"
+  if [[ -z "${secret_value}" ]]; then
+    return
+  fi
+  if ! gcloud secrets describe "${secret_name}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+    gcloud secrets create "${secret_name}" \
+      --project "${PROJECT_ID}" \
+      --replication-policy="automatic" >/dev/null
+  fi
+  printf "%s" "${secret_value}" | gcloud secrets versions add "${secret_name}" \
+    --project "${PROJECT_ID}" \
+    --data-file=- >/dev/null
+  echo "Updated upload token secret: ${secret_name}"
+}
+
 pause_scheduler_job_if_exists() {
   local job_name="$1"
   if gcloud scheduler jobs describe "${job_name}" --project "${PROJECT_ID}" --location "${REGION}" >/dev/null 2>&1; then
@@ -229,7 +272,11 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
   --member="serviceAccount:${RUN_SA}" \
   --role="roles/datastore.user" >/dev/null
 
+upsert_secret_value_if_present "${UPLOAD_TOKEN_SECRET_NAME}" "${UPLOAD_TOKEN_SECRET:-}"
+
 grant_secret_access "${GEMINI_SECRET_NAME}"
+require_secret_exists "${UPLOAD_TOKEN_SECRET_NAME}"
+grant_secret_access "${UPLOAD_TOKEN_SECRET_NAME}"
 if [[ "${ADMIN_DASHBOARD_ENABLED}" == "true" ]]; then
   grant_secret_access "${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME}"
 fi
@@ -335,6 +382,10 @@ CLOUD_TASKS_LOCATION: "${CLOUD_TASKS_LOCATION}"
 CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL: "${CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL}"
 CLOUD_TASKS_BASE_URL: ""
 CLOUD_TASKS_AUDIENCE: ""
+UPLOAD_TOKEN_TTL_MINUTES: "${UPLOAD_TOKEN_TTL_MINUTES}"
+CHAT_ATTACHMENT_TTL_MINUTES: "${CHAT_ATTACHMENT_TTL_MINUTES}"
+MAX_UPLOAD_FILE_BYTES: "${MAX_UPLOAD_FILE_BYTES}"
+UPLOAD_BASE_URL: ""
 CALLBACK_TASKS_QUEUE_NAME: "${CALLBACK_TASKS_QUEUE_NAME}"
 CALLBACK_TASKS_DISPATCH_DEADLINE_SECONDS: "${CALLBACK_TASKS_DISPATCH_DEADLINE_SECONDS}"
 PREWARM_TASKS_QUEUE_NAME: "${PREWARM_TASKS_QUEUE_NAME}"
@@ -390,7 +441,7 @@ SESSION_TTL_MINUTES: "${SESSION_TTL_MINUTES}"
 LOG_LEVEL: "${LOG_LEVEL}"
 YAML
 
-SET_SECRETS="GEMINI_API_KEY=${GEMINI_SECRET_NAME}:latest"
+SET_SECRETS="GEMINI_API_KEY=${GEMINI_SECRET_NAME}:latest,UPLOAD_TOKEN_SECRET=${UPLOAD_TOKEN_SECRET_NAME}:latest"
 if [[ "${ADMIN_DASHBOARD_ENABLED}" == "true" ]]; then
   SET_SECRETS="${SET_SECRETS},ADMIN_DASHBOARD_PASSWORD=${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME}:latest"
 fi
@@ -417,7 +468,7 @@ SERVICE_URL="$(gcloud run services describe "${SERVICE_NAME}" \
 gcloud run services update "${SERVICE_NAME}" \
   --project "${PROJECT_ID}" \
   --region "${REGION}" \
-  --update-env-vars "ADMIN_OIDC_AUDIENCE=${SERVICE_URL},CLOUD_TASKS_BASE_URL=${SERVICE_URL},CLOUD_TASKS_AUDIENCE=${SERVICE_URL}" >/dev/null
+  --update-env-vars "ADMIN_OIDC_AUDIENCE=${SERVICE_URL},CLOUD_TASKS_BASE_URL=${SERVICE_URL},CLOUD_TASKS_AUDIENCE=${SERVICE_URL},UPLOAD_BASE_URL=${SERVICE_URL}" >/dev/null
 
 gcloud run services add-iam-policy-binding "${SERVICE_NAME}" \
   --project "${PROJECT_ID}" \
@@ -497,6 +548,8 @@ Scheduler service account: ${SCHEDULER_SA}
 Scheduler jobs created: ${CREATE_SCHEDULER_JOBS}
 Firestore indexes ensured: ${ENSURE_FIRESTORE_INDEXES}
 Cloud Run timeout seconds: ${CLOUD_RUN_TIMEOUT_SECONDS}
+Upload base URL: ${SERVICE_URL}
+Upload token secret: ${UPLOAD_TOKEN_SECRET_NAME}
 Callback worker mode: ${CALLBACK_WORKER_MODE}
 Callback Cloud Tasks queue: ${CALLBACK_TASKS_QUEUE_NAME}
 Callback queue rate/concurrency/attempts: ${CALLBACK_TASKS_MAX_DISPATCHES_PER_SECOND}/${CALLBACK_TASKS_MAX_CONCURRENT_DISPATCHES}/${CALLBACK_TASKS_MAX_ATTEMPTS}

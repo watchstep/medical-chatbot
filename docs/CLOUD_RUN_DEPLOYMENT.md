@@ -15,6 +15,7 @@ test 환경 배포용 wrapper script입니다.
 ```text
 - test 환경 변수 설정
 - .env 또는 shell env의 ADMIN_DASHBOARD_PASSWORD를 Secret Manager에 반영
+- .env 또는 shell env의 UPLOAD_TOKEN_SECRET을 Secret Manager에 반영
 - repository root로 이동
 - root의 ./deploy-test.sh 실행
 ```
@@ -26,6 +27,7 @@ test 환경 배포용 wrapper script입니다.
 ```
 
 `.env` 또는 shell env에 `ADMIN_DASHBOARD_PASSWORD`가 있으면 `ADMIN_DASHBOARD_PASSWORD_SECRET_NAME` secret에 새 버전으로 업로드하고 대시보드를 활성화합니다.
+`.env` 또는 shell env에 `UPLOAD_TOKEN_SECRET`이 있으면 `UPLOAD_TOKEN_SECRET_NAME` secret에 새 버전으로 업로드하고 `/upload/{token}` 링크 서명 검증에 사용합니다.
 
 ### `deploy-test.sh`
 
@@ -42,7 +44,9 @@ test 환경 배포용 wrapper script입니다.
 - Cloud Run 환경변수 설정
 - Gemini API key Secret Manager 연동
 - 관리자 대시보드 비밀번호 Secret Manager 연동
+- 업로드 token secret Secret Manager 연동
 - Cloud Run URL 확인 후 OIDC audience 업데이트
+- Cloud Run URL 확인 후 `UPLOAD_BASE_URL` 업데이트
 - Cloud Scheduler job 생성 또는 업데이트
 - legacy 채팅 로그 export Scheduler job이 남아 있으면 pause
 ```
@@ -77,6 +81,7 @@ SCHEDULER_SA="medical-chatbot-test-scheduler@${PROJECT_ID}.iam.gserviceaccount.c
 SCHEDULER_TIME_ZONE="Asia/Seoul"
 ADMIN_DASHBOARD_PASSWORD_SECRET_NAME="admin-dashboard-password"
 GEMINI_SECRET_NAME="gemini-api-key"
+UPLOAD_TOKEN_SECRET_NAME="upload-token-secret-test"
 
 gcloud config set project "${PROJECT_ID}"
 ```
@@ -113,6 +118,17 @@ echo "${SERVICE_URL}"
 ADMIN_DASHBOARD_USERNAME=admin
 ADMIN_DASHBOARD_PASSWORD=replace-with-password
 ADMIN_DASHBOARD_PASSWORD_SECRET_NAME=admin-dashboard-password
+```
+
+파일 업로드 링크를 사용하려면 `.env`에 아래 값을 둡니다. `UPLOAD_TOKEN_SECRET`은 실제 운영값으로 교체해야 하며, test wrapper가 Secret Manager에 업로드합니다.
+
+```env
+# Example only. Replace with a long random value before deploy.
+UPLOAD_TOKEN_SECRET=replace-with-long-random-secret
+UPLOAD_TOKEN_SECRET_NAME=upload-token-secret-test
+UPLOAD_TOKEN_TTL_MINUTES=15
+CHAT_ATTACHMENT_TTL_MINUTES=60
+MAX_UPLOAD_FILE_BYTES=20971520
 ```
 
 ```bash

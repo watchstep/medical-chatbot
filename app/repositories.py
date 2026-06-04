@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - optional runtime dependency
 
 from app.config import Settings
 from app.schemas import (
+    ActiveAttachment,
     ChatLog,
     ChatSession,
     DriveFileIndexEntry,
@@ -26,6 +27,7 @@ from app.schemas import (
     MedicalWikiIndex,
     MedicalWikiPage,
     PatientProfile,
+    UploadToken,
 )
 from app.services.patient_identity import (
     make_patient_birth_key,
@@ -298,6 +300,27 @@ class MedicalRepository:
     def upsert_prewarm_job(self, job: GeminiFilePrewarmJob) -> None:
         raise NotImplementedError
 
+    def get_upload_token(self, token_id: str) -> UploadToken | None:
+        raise NotImplementedError
+
+    def upsert_upload_token(self, token: UploadToken) -> None:
+        raise NotImplementedError
+
+    def mark_upload_token_used(self, token_id: str, *, now: str) -> UploadToken | None:
+        raise NotImplementedError
+
+    def get_active_attachment(self, patient_id: str, kakao_user_id_hash: str) -> ActiveAttachment | None:
+        raise NotImplementedError
+
+    def upsert_active_attachment(self, attachment: ActiveAttachment) -> None:
+        raise NotImplementedError
+
+    def delete_active_attachment(self, patient_id: str, kakao_user_id_hash: str) -> None:
+        raise NotImplementedError
+
+    def list_expired_active_attachments(self, *, now: str, limit: int) -> list[ActiveAttachment]:
+        raise NotImplementedError
+
 
 @dataclass
 class InMemoryMedicalRepository(MedicalRepository):
@@ -315,6 +338,8 @@ class InMemoryMedicalRepository(MedicalRepository):
     chat_logs: dict[tuple[str, str], ChatLog] = field(default_factory=dict)
     callback_jobs: dict[str, KakaoCallbackJob] = field(default_factory=dict)
     prewarm_jobs: dict[str, GeminiFilePrewarmJob] = field(default_factory=dict)
+    upload_tokens: dict[str, UploadToken] = field(default_factory=dict)
+    active_attachments: dict[tuple[str, str], ActiveAttachment] = field(default_factory=dict)
 
     def _copy(self, value: Any) -> Any:
         return deepcopy(value)
@@ -770,6 +795,44 @@ class InMemoryMedicalRepository(MedicalRepository):
 
     def upsert_prewarm_job(self, job: GeminiFilePrewarmJob) -> None:
         self.prewarm_jobs[job.job_id] = self._copy(job)
+
+    def get_upload_token(self, token_id: str) -> UploadToken | None:
+        return self._copy(self.upload_tokens.get(token_id))
+
+    def upsert_upload_token(self, token: UploadToken) -> None:
+        self.upload_tokens[token.token_id] = self._copy(token)
+
+    def mark_upload_token_used(self, token_id: str, *, now: str) -> UploadToken | None:
+        token = self.upload_tokens.get(token_id)
+        if token is None:
+            return None
+        if token.status != "PENDING":
+            return None
+        if token.expires_at and _lease_expired(token.expires_at, now):
+            expired = token.model_copy(update={"status": "EXPIRED", "updated_at": now})
+            self.upload_tokens[token_id] = self._copy(expired)
+            return None
+        used = token.model_copy(update={"status": "USED", "used_at": now, "updated_at": now})
+        self.upload_tokens[token_id] = self._copy(used)
+        return self._copy(used)
+
+    def get_active_attachment(self, patient_id: str, kakao_user_id_hash: str) -> ActiveAttachment | None:
+        return self._copy(self.active_attachments.get((patient_id, kakao_user_id_hash)))
+
+    def upsert_active_attachment(self, attachment: ActiveAttachment) -> None:
+        self.active_attachments[(attachment.patient_id, attachment.kakao_user_id_hash)] = self._copy(attachment)
+
+    def delete_active_attachment(self, patient_id: str, kakao_user_id_hash: str) -> None:
+        self.active_attachments.pop((patient_id, kakao_user_id_hash), None)
+
+    def list_expired_active_attachments(self, *, now: str, limit: int) -> list[ActiveAttachment]:
+        items = [
+            self._copy(attachment)
+            for attachment in self.active_attachments.values()
+            if attachment.status == "ACTIVE" and attachment.expires_at and _lease_expired(attachment.expires_at, now)
+        ]
+        items.sort(key=lambda item: (item.expires_at, item.attachment_id))
+        return items[:limit]
 
 
 class FirestoreMedicalRepository(MedicalRepository):
@@ -1401,6 +1464,65 @@ class FirestoreMedicalRepository(MedicalRepository):
 
     def upsert_prewarm_job(self, job: GeminiFilePrewarmJob) -> None:
         self._set_model(job, "gemini_file_prewarm_jobs", job.job_id)
+
+    def get_upload_token(self, token_id: str) -> UploadToken | None:
+        return self._get_model(UploadToken, "upload_tokens", token_id)
+
+    def upsert_upload_token(self, token: UploadToken) -> None:
+        self._set_model(token, "upload_tokens", token.token_id)
+
+    def mark_upload_token_used(self, token_id: str, *, now: str) -> UploadToken | None:
+        doc_ref = self._doc("upload_tokens", token_id)
+        transaction = self.client.transaction()
+
+        @firestore.transactional
+        def mark_used_in_transaction(transaction: Any) -> UploadToken | None:
+            snapshot = doc_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                return None
+            token = UploadToken.model_validate(snapshot.to_dict() or {})
+            if token.status != "PENDING":
+                return None
+            if token.expires_at and _lease_expired(token.expires_at, now):
+                expired = token.model_copy(update={"status": "EXPIRED", "updated_at": now})
+                transaction.set(doc_ref, expired.model_dump(exclude_none=True), merge=True)
+                return None
+            used = token.model_copy(update={"status": "USED", "used_at": now, "updated_at": now})
+            transaction.set(doc_ref, used.model_dump(exclude_none=True), merge=True)
+            return used
+
+        return mark_used_in_transaction(transaction)
+
+    def get_active_attachment(self, patient_id: str, kakao_user_id_hash: str) -> ActiveAttachment | None:
+        return self._get_model(
+            ActiveAttachment,
+            "patients",
+            patient_id,
+            "active_attachments",
+            kakao_user_id_hash,
+        )
+
+    def upsert_active_attachment(self, attachment: ActiveAttachment) -> None:
+        self._set_model(
+            attachment,
+            "patients",
+            attachment.patient_id,
+            "active_attachments",
+            attachment.kakao_user_id_hash,
+        )
+
+    def delete_active_attachment(self, patient_id: str, kakao_user_id_hash: str) -> None:
+        self._doc("patients", patient_id, "active_attachments", kakao_user_id_hash).delete()
+
+    def list_expired_active_attachments(self, *, now: str, limit: int) -> list[ActiveAttachment]:
+        query = (
+            self.client.collection_group("active_attachments")
+            .where("status", "==", "ACTIVE")
+            .where("expires_at", "<=", now)
+            .order_by("expires_at")
+            .limit(limit)
+        )
+        return [ActiveAttachment.model_validate(snapshot.to_dict() or {}) for snapshot in query.stream()]
 
 
 def build_default_medical_repository(settings: Settings) -> MedicalRepository:

@@ -27,6 +27,10 @@ from app.services.kakao_callback import build_callback_ack_response, build_simpl
 from app.services.medical_wiki import format_medical_source_display_name, now_kst_iso
 from app.services.patient_identity import normalize_patient_birth, normalize_patient_name
 from app.services.security import hash_kakao_user_id
+from app.services.temporary_attachments import (
+    TemporaryAttachmentConfigError,
+    TemporaryAttachmentService,
+)
 
 
 
@@ -36,7 +40,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 AUTH_PREFIX = "인증 "
-AUTH_RESET_COMMANDS = {"인증 초기화", "인증초기화", "다른 환자 인증", "환자 변경", "재인증"}
+
+
+def _command_key(value: str) -> str:
+    return "".join(value.split()).casefold()
+
+
+AUTH_RESET_COMMAND_KEYS = frozenset(
+    {
+        "인증초기화",
+        "환자초기화",
+        "다른환자인증",
+        "환자변경",
+        "재인증",
+    }
+)
 LATEST_RECORD_INTENTS = {
     "기록",
     "진단기록",
@@ -78,13 +96,17 @@ AUTH_SUCCESS_MESSAGE = (
     "{patient_name}님 안녕하세요.🙂\n"
     "인증이 완료되었습니다.\n\n"
     "아래 메뉴에서 [🔍 의료 기록 조회]을 누르거나,\n"
-    '채팅창에 "의료 기록 조회"라고 입력해 주세요.'
+    '채팅창에 "의료 기록 조회"라고 입력해 주세요.\n\n'
+    "기존 등록 진료기록 외에\n"
+    '별도의 PDF나 이미지 파일 질문하고 싶다면 [📎 파일 업로드]을 누르거나 "파일 업로드"라고 입력해 주세요.'
 )
 AUTHENTICATED_START_BLOCK_MESSAGE = (
     "{patient_name}님 안녕하세요.🙂\n"
     "진료 기록 확인이 가능합니다.\n\n"
     "아래 메뉴에서 [🔍 의료 기록 조회]을 누르거나,\n"
     '채팅창에 "의료 기록 조회"라고 입력해 주세요.\n\n'
+    "기존 등록 진료기록 외에\n"
+    '별도의 PDF나 이미지 파일 질문하고 싶다면 [📎 파일 업로드]을 누르거나 "파일 업로드"라고 입력해 주세요.\n\n'
     "진료 기록에 대해 궁금한 점이 있다면 아래 채팅창에 질문을 입력해 주세요.\n\n"
     '🤳다른 환자로 인증하려면 "인증 초기화"라고 입력해 주세요.'
 )
@@ -107,6 +129,25 @@ RECORD_PREPARING_MESSAGE = (
 CALLBACK_UNAVAILABLE_MESSAGE = (
     "현재 답변 서비스 이용이 원활하지 않습니다.\n잠시 후 다시 시도해 주세요.🙇‍♂️ "
 )
+UPLOAD_COMMAND_KEYS = frozenset(
+    {
+        "파일업로드",
+        "pdf업로드",
+        "이미지업로드",
+        "사진업로드",
+    }
+)
+UPLOAD_CONFIG_UNAVAILABLE_MESSAGE = "현재 파일 업로드 기능을 사용할 수 없습니다.\n잠시 후 다시 시도해 주세요.🙇‍♂️"
+UPLOAD_LINK_LOG_MESSAGE = "업로드 링크를 발급했습니다."
+UPLOAD_ATTACHMENT_MISSING_MESSAGE = (
+    "최근 업로드한 파일을 찾지 못했습니다.\n"
+    '먼저 "파일 업로드"라고 입력해 업로드 링크를 받은 뒤 파일을 올려 주세요.'
+)
+
+
+def _matches_command(value: str, command_keys: frozenset[str]) -> bool:
+    return _command_key(value) in command_keys
+
 
 @dataclass
 class FirestoreChatbotService:
@@ -115,6 +156,7 @@ class FirestoreChatbotService:
     callback_job_processor: "CallbackJobProcessor | None" = None
     callback_task_enqueue_service: CallbackTaskEnqueueService | None = None
     prewarm_enqueue_service: GeminiFilePrewarmEnqueueService | None = None
+    temporary_attachment_service: TemporaryAttachmentService | None = None
     session_ttl_minutes: int = 1440
 
     async def handle_auth_entry(
@@ -127,7 +169,7 @@ class FirestoreChatbotService:
         utterance = payload.user_request.utterance.strip()
         kakao_user_id_hash = hash_kakao_user_id(user_id)
 
-        if utterance in AUTH_RESET_COMMANDS:
+        if self._is_auth_reset_command(utterance):
             self._reset_auth(kakao_user_id_hash)
             return build_simple_text_response(AUTH_RESET_MESSAGE)
 
@@ -137,6 +179,12 @@ class FirestoreChatbotService:
         patient = self._resolve_patient(kakao_user_id_hash)
         if patient is None:
             return build_simple_text_response(UNMAPPED_USER_MESSAGE)
+        if self._is_upload_command(utterance):
+            answer_text, _ = self._build_upload_link_response(
+                patient_id=patient.patient_id,
+                kakao_user_id_hash=kakao_user_id_hash,
+            )
+            return build_simple_text_response(answer_text)
         self._try_enqueue_prewarm(patient_id=patient.patient_id, reason="authenticated_start")
         return build_simple_text_response(
             AUTHENTICATED_START_BLOCK_MESSAGE.format(patient_name=patient.name)
@@ -152,7 +200,7 @@ class FirestoreChatbotService:
         callback_url = payload.user_request.callback_url
         kakao_user_id_hash = hash_kakao_user_id(user_id)
 
-        if utterance in AUTH_RESET_COMMANDS:
+        if self._is_auth_reset_command(utterance):
             self._reset_auth(kakao_user_id_hash)
             return build_simple_text_response(AUTH_RESET_MESSAGE)
         if utterance.startswith(AUTH_PREFIX):
@@ -169,6 +217,20 @@ class FirestoreChatbotService:
             message_type="question",
         )
 
+        if self._is_upload_command(utterance):
+            answer_text, log_text = self._build_upload_link_response(
+                patient_id=patient.patient_id,
+                kakao_user_id_hash=kakao_user_id_hash,
+            )
+            self._create_assistant_chat_log(
+                patient=patient,
+                kakao_user_id_hash=kakao_user_id_hash,
+                message=log_text,
+                message_type="system",
+                related_log_id=chat_log_id,
+            )
+            return build_simple_text_response(answer_text)
+
         if self._is_latest_record_intent(utterance):
             self._try_enqueue_prewarm(patient_id=patient.patient_id, reason="medical_record_lookup")
             answer_text = self._latest_record_message(patient.patient_id)
@@ -180,6 +242,29 @@ class FirestoreChatbotService:
                 related_log_id=chat_log_id,
             )
             return build_simple_text_response(answer_text)
+
+        answer_route = "drive"
+        attachment_id = ""
+        if self._is_temporary_attachment_reference(utterance):
+            attachment = (
+                self.temporary_attachment_service.get_current_attachment(
+                    patient_id=patient.patient_id,
+                    kakao_user_id_hash=kakao_user_id_hash,
+                )
+                if self.temporary_attachment_service is not None
+                else None
+            )
+            if attachment is None:
+                self._create_assistant_chat_log(
+                    patient=patient,
+                    kakao_user_id_hash=kakao_user_id_hash,
+                    message=UPLOAD_ATTACHMENT_MISSING_MESSAGE,
+                    message_type="system",
+                    related_log_id=chat_log_id,
+                )
+                return build_simple_text_response(UPLOAD_ATTACHMENT_MISSING_MESSAGE)
+            answer_route = "temporary_attachment"
+            attachment_id = attachment.attachment_id
 
         if not callback_url:
             self._create_assistant_chat_log(
@@ -198,6 +283,8 @@ class FirestoreChatbotService:
             utterance=utterance,
             callback_url=callback_url,
             now=now,
+            answer_route=answer_route,
+            attachment_id=attachment_id,
         )
         existing_job = self.repository.get_callback_job_by_idempotency_key(idempotency_key)
         if existing_job is not None and existing_job.status in {"PENDING", "PROCESSING"}:
@@ -211,6 +298,8 @@ class FirestoreChatbotService:
             kakao_user_id_hash=kakao_user_id_hash,
             chat_log_id=chat_log_id,
             callback_url=callback_url,
+            answer_route=answer_route,  # type: ignore[arg-type]
+            attachment_id=attachment_id,
             idempotency_key=idempotency_key,
             max_attempts=self.settings.callback_job_max_attempts,
             runnable=True,
@@ -337,6 +426,8 @@ class FirestoreChatbotService:
         utterance: str,
         callback_url: str,
         now: datetime,
+        answer_route: str = "drive",
+        attachment_id: str = "",
     ) -> str:
         normalized_utterance = " ".join(utterance.split()).casefold()
         callback_hash = hashlib.sha256(callback_url.encode("utf-8")).hexdigest()[:16]
@@ -349,8 +440,31 @@ class FirestoreChatbotService:
                 utterance_hash,
                 callback_hash,
                 minute_bucket,
+                answer_route,
+                attachment_id,
             ]
         )
+
+    def _build_upload_link_response(self, *, patient_id: str, kakao_user_id_hash: str) -> tuple[str, str]:
+        if self.temporary_attachment_service is None:
+            return UPLOAD_CONFIG_UNAVAILABLE_MESSAGE, UPLOAD_CONFIG_UNAVAILABLE_MESSAGE
+        try:
+            link = self.temporary_attachment_service.create_upload_link(
+                patient_id=patient_id,
+                kakao_user_id_hash=kakao_user_id_hash,
+            )
+        except TemporaryAttachmentConfigError:
+            logger.warning("temporary upload is not configured patient_id=%s", patient_id)
+            return UPLOAD_CONFIG_UNAVAILABLE_MESSAGE, UPLOAD_CONFIG_UNAVAILABLE_MESSAGE
+        except Exception:
+            logger.exception("temporary upload link creation failed patient_id=%s", patient_id)
+            return UPLOAD_CONFIG_UNAVAILABLE_MESSAGE, UPLOAD_CONFIG_UNAVAILABLE_MESSAGE
+        text = (
+            "아래 링크에서 PDF 또는 이미지를 1개 업로드해 주세요.\n"
+            f"{link.url}\n\n"
+            f"링크는 {self.settings.upload_token_ttl_minutes}분 동안 사용할 수 있습니다."
+        )
+        return text, UPLOAD_LINK_LOG_MESSAGE
 
     def _handle_auth(self, *, kakao_user_id_hash: str, utterance: str) -> dict:
         tokens = utterance.split()
@@ -509,6 +623,29 @@ class FirestoreChatbotService:
             "의료기록조회",
             "의료기록보여줘",
         }
+
+    def _is_upload_command(self, utterance: str) -> bool:
+        return _matches_command(utterance, UPLOAD_COMMAND_KEYS)
+
+    def _is_auth_reset_command(self, utterance: str) -> bool:
+        return _matches_command(utterance, AUTH_RESET_COMMAND_KEYS)
+
+    def _is_temporary_attachment_reference(self, utterance: str) -> bool:
+        normalized = utterance.replace(" ", "").casefold()
+        phrases = [
+            "방금파일",
+            "방금올린파일",
+            "이파일",
+            "업로드한파일",
+            "업로드파일",
+            "첨부한파일",
+            "첨부파일",
+            "이pdf",
+            "올린pdf",
+            "이이미지",
+            "올린이미지",
+        ]
+        return any(phrase in normalized for phrase in phrases)
 
     def _is_expired(self, value: str) -> bool:
         if not value:

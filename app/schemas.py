@@ -61,6 +61,9 @@ RuntimeSyncStatus = Literal[
 GeminiFileState = Literal["NONE", "UPLOADING", "PROCESSING", "ACTIVE", "EXPIRED", "FAILED"]
 CallbackJobStatus = Literal["PENDING", "PROCESSING", "CALLBACK_SENT", "FAILED", "EXPIRED"]
 GeminiFilePrewarmJobStatus = Literal["PENDING", "PROCESSING", "DONE", "SKIPPED", "FAILED", "EXPIRED"]
+UploadTokenStatus = Literal["PENDING", "USED", "EXPIRED"]
+ActiveAttachmentStatus = Literal["ACTIVE", "EXPIRED", "DELETED"]
+CallbackAnswerRoute = Literal["drive", "temporary_attachment"]
 MedicalWikiCategory = Literal[
     "health_checkup",
     "lab_result",
@@ -229,6 +232,31 @@ class GeminiFileRuntime(BaseModel):
     source_file_size_bytes: int | None = None
 
 
+class UploadToken(BaseModel):
+    token_id: str
+    patient_id: str
+    kakao_user_id_hash: str
+    status: UploadTokenStatus = "PENDING"
+    expires_at: str = ""
+    used_at: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class ActiveAttachment(BaseModel):
+    attachment_id: str
+    upload_token_id: str = ""
+    patient_id: str
+    kakao_user_id_hash: str
+    gemini_file: GeminiFileRuntime = Field(default_factory=GeminiFileRuntime)
+    mime_type: str = ""
+    file_size_bytes: int | None = None
+    status: ActiveAttachmentStatus = "ACTIVE"
+    expires_at: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
 class GeminiFilesCleanupDeletedItem(BaseModel):
     patient_id: str
     source_id: str
@@ -382,6 +410,8 @@ class KakaoCallbackJob(BaseModel):
     chat_log_id: str
     status: CallbackJobStatus = "PENDING"
     callback_url: str = ""
+    answer_route: CallbackAnswerRoute = "drive"
+    attachment_id: str = ""
 
     # Durable callback worker fields.
     # retry_count is treated as the number of processing attempts.

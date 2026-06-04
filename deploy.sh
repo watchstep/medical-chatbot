@@ -49,6 +49,7 @@ WIKI_REBUILD_TASKS_MAX_BACKOFF="${WIKI_REBUILD_TASKS_MAX_BACKOFF:-300s}"
 WIKI_REBUILD_TASKS_MAX_DOUBLINGS="${WIKI_REBUILD_TASKS_MAX_DOUBLINGS:-2}"
 WIKI_REBUILD_TASKS_MAX_RETRY_DURATION="${WIKI_REBUILD_TASKS_MAX_RETRY_DURATION:-1800s}"
 GEMINI_SECRET_NAME="${GEMINI_SECRET_NAME:-gemini-api-key}"
+UPLOAD_TOKEN_SECRET_NAME="${UPLOAD_TOKEN_SECRET_NAME:-upload-token-secret}"
 ADMIN_DASHBOARD_ENABLED="${ADMIN_DASHBOARD_ENABLED:-false}"
 ADMIN_DASHBOARD_USERNAME="${ADMIN_DASHBOARD_USERNAME:-admin}"
 ADMIN_DASHBOARD_PASSWORD_SECRET_NAME="${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME:-admin-dashboard-password}"
@@ -78,6 +79,18 @@ ensure_firestore_composite_indexes() {
     --database "${FIRESTORE_DATABASE_ID}" \
     --collection-group "kakao_callback_jobs" \
     --query-scope "COLLECTION" \
+    --field-config "field-path=status,order=ascending" \
+    --field-config "field-path=expires_at,order=ascending" \
+    --async >/dev/null 2>&1 || true
+
+  # Required by temporary upload attachment cleanup:
+  # collection_group(active_attachments) where(status == ACTIVE)
+  # + where(expires_at <= now) + order_by(expires_at).
+  gcloud firestore indexes composite create \
+    --project "${PROJECT_ID}" \
+    --database "${FIRESTORE_DATABASE_ID}" \
+    --collection-group "active_attachments" \
+    --query-scope "COLLECTION_GROUP" \
     --field-config "field-path=status,order=ascending" \
     --field-config "field-path=expires_at,order=ascending" \
     --async >/dev/null 2>&1 || true
@@ -165,6 +178,8 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --role="roles/datastore.user" >/dev/null
 
 grant_secret_access "$GEMINI_SECRET_NAME"
+require_secret_exists "$UPLOAD_TOKEN_SECRET_NAME"
+grant_secret_access "$UPLOAD_TOKEN_SECRET_NAME"
 if [[ "$ADMIN_DASHBOARD_ENABLED" == "true" ]]; then
   require_secret_exists "$ADMIN_DASHBOARD_PASSWORD_SECRET_NAME"
   grant_secret_access "$ADMIN_DASHBOARD_PASSWORD_SECRET_NAME"
@@ -240,6 +255,10 @@ ENV_VARS+=",FULL_SYNC_LOCK_LEASE_MINUTES=10"
 ENV_VARS+=",FOLDER_INDEX_BOOTSTRAP_ON_CHANGES=true"
 ENV_VARS+=",FILE_READY_WAIT_SECONDS=30"
 ENV_VARS+=",FILE_UPLOAD_LOCK_LEASE_SECONDS=${FILE_UPLOAD_LOCK_LEASE_SECONDS:-600}"
+ENV_VARS+=",UPLOAD_TOKEN_TTL_MINUTES=${UPLOAD_TOKEN_TTL_MINUTES:-15}"
+ENV_VARS+=",CHAT_ATTACHMENT_TTL_MINUTES=${CHAT_ATTACHMENT_TTL_MINUTES:-60}"
+ENV_VARS+=",MAX_UPLOAD_FILE_BYTES=${MAX_UPLOAD_FILE_BYTES:-20971520}"
+ENV_VARS+=",UPLOAD_BASE_URL="
 ENV_VARS+=",GEMINI_FILES_STORAGE_SOFT_LIMIT_BYTES=${GEMINI_FILES_STORAGE_SOFT_LIMIT_BYTES:-15032385536}"
 ENV_VARS+=",GEMINI_FILES_STORAGE_TARGET_BYTES=${GEMINI_FILES_STORAGE_TARGET_BYTES:-12884901888}"
 ENV_VARS+=",GEMINI_FILES_STORAGE_HARD_LIMIT_BYTES=${GEMINI_FILES_STORAGE_HARD_LIMIT_BYTES:-18253611008}"
@@ -296,7 +315,7 @@ ENV_VARS+=",GEMINI_PARSING_TOP_K=1"
 ENV_VARS+=",GEMINI_PARSING_THINKING_LEVEL=minimal"
 ENV_VARS+=",LOG_LEVEL=INFO"
 
-SET_SECRETS="GEMINI_API_KEY=${GEMINI_SECRET_NAME}:latest"
+SET_SECRETS="GEMINI_API_KEY=${GEMINI_SECRET_NAME}:latest,UPLOAD_TOKEN_SECRET=${UPLOAD_TOKEN_SECRET_NAME}:latest"
 if [[ "$ADMIN_DASHBOARD_ENABLED" == "true" ]]; then
   SET_SECRETS="${SET_SECRETS},ADMIN_DASHBOARD_PASSWORD=${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME}:latest"
 fi
@@ -322,7 +341,7 @@ SERVICE_URL=$(gcloud run services describe "$SERVICE_NAME" \
 gcloud run services update "$SERVICE_NAME" \
   --quiet \
   --region "$REGION" \
-  --update-env-vars "ADMIN_OIDC_AUDIENCE=${SERVICE_URL},CLOUD_TASKS_BASE_URL=${SERVICE_URL},CLOUD_TASKS_AUDIENCE=${SERVICE_URL}"
+  --update-env-vars "ADMIN_OIDC_AUDIENCE=${SERVICE_URL},CLOUD_TASKS_BASE_URL=${SERVICE_URL},CLOUD_TASKS_AUDIENCE=${SERVICE_URL},UPLOAD_BASE_URL=${SERVICE_URL}"
 
 gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
   --quiet \
@@ -396,6 +415,8 @@ echo "Firestore indexes ensured: ${ENSURE_FIRESTORE_INDEXES}"
 echo "Admin OIDC audience: ${SERVICE_URL}"
 echo "Allowed admin caller: ${ALLOWED_EMAILS}"
 echo "Cloud Run timeout seconds: ${CLOUD_RUN_TIMEOUT_SECONDS}"
+echo "Upload base URL: ${SERVICE_URL}"
+echo "Upload token secret: ${UPLOAD_TOKEN_SECRET_NAME}"
 echo "Callback Cloud Tasks queue: ${CALLBACK_TASKS_QUEUE_NAME}"
 echo "Callback queue rate/concurrency/attempts: ${CALLBACK_TASKS_MAX_DISPATCHES_PER_SECOND}/${CALLBACK_TASKS_MAX_CONCURRENT_DISPATCHES}/${CALLBACK_TASKS_MAX_ATTEMPTS}"
 echo "Prewarm Cloud Tasks queue: ${PREWARM_TASKS_QUEUE_NAME}"
