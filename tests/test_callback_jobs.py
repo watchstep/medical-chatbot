@@ -113,6 +113,7 @@ KST = timezone(timedelta(hours=9))
 class FakeRouterGateway:
     def __init__(self, source_id: str) -> None:
         self.source_id = source_id
+        self.questions: list[str] = []
 
     def generate_json(
         self,
@@ -127,6 +128,7 @@ class FakeRouterGateway:
     ) -> str:
         del model, system_instruction, response_schema, temperature, max_output_tokens, thinking_level
         question = json.loads(contents[0])["question"]
+        self.questions.append(question)
         if question == "고혈압이 뭐야?":
             payload = {
                 "selection_status": "insufficient",
@@ -352,12 +354,13 @@ class CallbackJobProcessorTest(unittest.TestCase):
         self.qa_service = FakeGeminiFilesQaService()
         self.callback_service = FakeKakaoCallbackService()
         self.temporary_attachment_service = FakeTemporaryAttachmentService()
+        self.router_gateway = FakeRouterGateway(self.source_id)
         self.processor = CallbackJobProcessor(
             settings=self.settings,
             repository=self.repository,
             router_service=MedicalRouterService(
                 settings=self.settings,
-                gateway=FakeRouterGateway(self.source_id),
+                gateway=self.router_gateway,
             ),
             gemini_files_qa_service=self.qa_service,  # type: ignore[arg-type]
             kakao_callback_service=self.callback_service,  # type: ignore[arg-type]
@@ -609,7 +612,23 @@ class CallbackJobProcessorTest(unittest.TestCase):
 
         self.assertEqual(result.status, "CALLBACK_SENT")
         self.assertEqual(self.qa_service.calls, ["answer", "render"])
+        self.assertEqual(self.router_gateway.questions, [])
         self.assertIn("문서에서 관련 내용이 확인됩니다", self.callback_service.calls[0]["text"])
+
+    def test_temporary_attachment_job_skips_router_out_of_scope(self) -> None:
+        self._create_job(
+            message="오늘 날씨 어때? 방금 파일에 대해 설명해줘",
+            answer_route="temporary_attachment",
+            attachment_id="ATT_TEST",
+        )
+
+        result = self.processor.process_job("JOB_TEST")
+
+        self.assertEqual(result.status, "CALLBACK_SENT")
+        self.assertEqual(self.router_gateway.questions, [])
+        self.assertEqual(self.qa_service.calls, ["answer", "render"])
+        self.assertIn("문서에서 관련 내용이 확인됩니다", self.callback_service.calls[0]["text"])
+        self.assertNotIn("의료 기록과 관련된 질문", self.callback_service.calls[0]["text"])
 
 
 if __name__ == "__main__":

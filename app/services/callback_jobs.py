@@ -472,36 +472,6 @@ class CallbackJobProcessor:
         if self.temporary_attachment_service is None:
             raise GeminiFilesQaError("Temporary attachment service is not configured")
 
-        router_started_at = timing_start(logger, "temporary_router.start", job_id=job_id, patient_id=job.patient_id)
-        try:
-            selection = self.router_service.select_source(
-                question=question,
-                prior_context=prior_context,
-                wiki_index=MedicalWikiIndex(patient_id=job.patient_id),
-            )
-        except Exception:
-            timing_done(
-                logger,
-                "temporary_router.done",
-                router_started_at,
-                status="error",
-                job_id=job_id,
-                patient_id=job.patient_id,
-                error_code="ROUTER_FAILED",
-            )
-            raise
-        timing_done(
-            logger,
-            "temporary_router.done",
-            router_started_at,
-            status=selection.intent,
-            job_id=job_id,
-            patient_id=job.patient_id,
-            intent=selection.intent,
-        )
-        if selection.intent in FIXED_INTENT_TO_STATUS:
-            return FinalQaAnswer(status=FIXED_INTENT_TO_STATUS[selection.intent])
-
         attachment = self.temporary_attachment_service.get_current_attachment(
             patient_id=job.patient_id,
             kakao_user_id_hash=job.kakao_user_id_hash,

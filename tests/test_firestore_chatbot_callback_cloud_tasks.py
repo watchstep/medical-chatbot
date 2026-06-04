@@ -268,6 +268,27 @@ class FirestoreChatbotCloudTasksTest(unittest.TestCase):
         self.assertEqual(stored.answer_route, "temporary_attachment")
         self.assertEqual(stored.attachment_id, "ATT_TEST")
 
+    def test_recent_file_question_snapshots_attachment_on_callback_job(self) -> None:
+        self.temporary_service.attachment = ActiveAttachment(
+            attachment_id="ATT_TEST",
+            patient_id=self.patient.patient_id,
+            kakao_user_id_hash=hash_kakao_user_id("kakao-user-1"),
+            gemini_file=GeminiFileRuntime(file_name="files/temp", state="ACTIVE"),
+            expires_at=(datetime.now(KST) + timedelta(minutes=30)).isoformat(),
+        )
+        background_tasks = BackgroundTasks()
+
+        response = asyncio.run(
+            self.chatbot.handle_chat(skill_request(utterance="방금 파일에 대해 설명해줘"), background_tasks)
+        )
+
+        self.assertEqual(response["version"], "2.0")
+        job_id = self.enqueue_service.calls[-1]
+        stored = self.repository.get_callback_job(job_id)
+        assert stored is not None
+        self.assertEqual(stored.answer_route, "temporary_attachment")
+        self.assertEqual(stored.attachment_id, "ATT_TEST")
+
     def test_explicit_attachment_question_without_active_file_does_not_fallback_to_drive(self) -> None:
         background_tasks = BackgroundTasks()
 
