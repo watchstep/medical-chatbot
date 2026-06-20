@@ -1,12 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
-PROJECT_ID="${PROJECT_ID:-medical-chatbot-494315}"
+PROJECT_ID="${PROJECT_ID:-medical-chatbot-498909}"
 REGION="${REGION:-asia-northeast3}"
 SERVICE_NAME="${SERVICE_NAME:-medical-chatbot}"
 FIRESTORE_DATABASE_ID="${FIRESTORE_DATABASE_ID:-medical-chatbot}"
+APP_ENV="${APP_ENV:-prod}"
+APP_NAME="${APP_NAME:-medical-chatbot}"
 DEPLOY_FIRESTORE_INDEXES="${DEPLOY_FIRESTORE_INDEXES:-false}"
 ENSURE_FIRESTORE_INDEXES="${ENSURE_FIRESTORE_INDEXES:-true}"
+CREATE_SCHEDULER_JOBS="${CREATE_SCHEDULER_JOBS:-true}"
+SCHEDULER_TIME_ZONE="${SCHEDULER_TIME_ZONE:-Asia/Seoul}"
+RUN_FULL_SYNC_AFTER_DEPLOY="${RUN_FULL_SYNC_AFTER_DEPLOY:-false}"
 RUN_SA="${RUN_SA:-medical-chatbot-run@${PROJECT_ID}.iam.gserviceaccount.com}"
 SCHEDULER_SA="${SCHEDULER_SA:-medical-chatbot-scheduler@${PROJECT_ID}.iam.gserviceaccount.com}"
 DRIVE_CHANGES_JOB_NAME="${DRIVE_CHANGES_JOB_NAME:-medical-chatbot-sync-drive-changes}"
@@ -24,6 +29,11 @@ GEMINI_FILE_PREWARM_DISPATCH_DEADLINE_SECONDS="${GEMINI_FILE_PREWARM_DISPATCH_DE
 WIKI_REBUILD_TASKS_DISPATCH_DEADLINE_SECONDS="${WIKI_REBUILD_TASKS_DISPATCH_DEADLINE_SECONDS:-600}"
 WIKI_REBUILD_WORKER_MODE="${WIKI_REBUILD_WORKER_MODE:-cloud_tasks}"
 CLOUD_RUN_TIMEOUT_SECONDS="${CLOUD_RUN_TIMEOUT_SECONDS:-900}"
+CLOUD_RUN_MEMORY="${CLOUD_RUN_MEMORY:-2Gi}"
+CLOUD_RUN_CPU="${CLOUD_RUN_CPU:-2}"
+CLOUD_RUN_MIN_INSTANCES="${CLOUD_RUN_MIN_INSTANCES:-2}"
+CLOUD_RUN_MAX_INSTANCES="${CLOUD_RUN_MAX_INSTANCES:-12}"
+CLOUD_RUN_CONCURRENCY="${CLOUD_RUN_CONCURRENCY:-20}"
 
 CALLBACK_TASKS_MAX_DISPATCHES_PER_SECOND="${CALLBACK_TASKS_MAX_DISPATCHES_PER_SECOND:-2}"
 CALLBACK_TASKS_MAX_CONCURRENT_DISPATCHES="${CALLBACK_TASKS_MAX_CONCURRENT_DISPATCHES:-5}"
@@ -41,8 +51,8 @@ PREWARM_TASKS_MAX_BACKOFF="${PREWARM_TASKS_MAX_BACKOFF:-300s}"
 PREWARM_TASKS_MAX_DOUBLINGS="${PREWARM_TASKS_MAX_DOUBLINGS:-2}"
 PREWARM_TASKS_MAX_RETRY_DURATION="${PREWARM_TASKS_MAX_RETRY_DURATION:-1200s}"
 
-WIKI_REBUILD_TASKS_MAX_DISPATCHES_PER_SECOND="${WIKI_REBUILD_TASKS_MAX_DISPATCHES_PER_SECOND:-0.5}"
-WIKI_REBUILD_TASKS_MAX_CONCURRENT_DISPATCHES="${WIKI_REBUILD_TASKS_MAX_CONCURRENT_DISPATCHES:-2}"
+WIKI_REBUILD_TASKS_MAX_DISPATCHES_PER_SECOND="${WIKI_REBUILD_TASKS_MAX_DISPATCHES_PER_SECOND:-0.2}"
+WIKI_REBUILD_TASKS_MAX_CONCURRENT_DISPATCHES="${WIKI_REBUILD_TASKS_MAX_CONCURRENT_DISPATCHES:-1}"
 WIKI_REBUILD_TASKS_MAX_ATTEMPTS="${WIKI_REBUILD_TASKS_MAX_ATTEMPTS:-4}"
 WIKI_REBUILD_TASKS_MIN_BACKOFF="${WIKI_REBUILD_TASKS_MIN_BACKOFF:-60s}"
 WIKI_REBUILD_TASKS_MAX_BACKOFF="${WIKI_REBUILD_TASKS_MAX_BACKOFF:-300s}"
@@ -53,10 +63,28 @@ UPLOAD_TOKEN_SECRET_NAME="${UPLOAD_TOKEN_SECRET_NAME:-upload-token-secret}"
 ADMIN_DASHBOARD_ENABLED="${ADMIN_DASHBOARD_ENABLED:-false}"
 ADMIN_DASHBOARD_USERNAME="${ADMIN_DASHBOARD_USERNAME:-admin}"
 ADMIN_DASHBOARD_PASSWORD_SECRET_NAME="${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME:-admin-dashboard-password}"
+BUILD_SERVICE_ACCOUNT_EMAIL="${BUILD_SERVICE_ACCOUNT_EMAIL:-}"
 
+echo "[deploy] target: ${PROJECT_ID} / ${REGION} / ${SERVICE_NAME}"
+echo "[deploy] setting gcloud project: ${PROJECT_ID}"
 gcloud config set project "$PROJECT_ID"
 
-gcloud services enable cloudtasks.googleapis.com run.googleapis.com firestore.googleapis.com cloudscheduler.googleapis.com secretmanager.googleapis.com --project "$PROJECT_ID" >/dev/null
+echo "[deploy] enabling required APIs"
+gcloud services enable \
+  artifactregistry.googleapis.com \
+  cloudbuild.googleapis.com \
+  cloudtasks.googleapis.com \
+  cloudscheduler.googleapis.com \
+  drive.googleapis.com \
+  firestore.googleapis.com \
+  generativelanguage.googleapis.com \
+  run.googleapis.com \
+  secretmanager.googleapis.com \
+  --project "$PROJECT_ID" >/dev/null
+
+if [[ -z "$BUILD_SERVICE_ACCOUNT_EMAIL" ]]; then
+  BUILD_SERVICE_ACCOUNT_EMAIL="$(gcloud builds get-default-service-account --project "$PROJECT_ID")"
+fi
 
 
 ensure_firestore_composite_indexes() {
@@ -160,15 +188,20 @@ pause_scheduler_job_if_exists() {
 }
 
 if [[ "${ENSURE_FIRESTORE_INDEXES}" == "true" ]]; then
+  echo "[deploy] ensuring Firestore composite indexes"
   ensure_firestore_composite_indexes
+else
+  echo "[deploy] skipping Firestore composite index ensure"
 fi
 
+echo "[deploy] ensuring service accounts"
 ensure_service_account "$RUN_SA" "Medical Chatbot Cloud Run Runtime"
 ensure_service_account "$SCHEDULER_SA" "Medical Chatbot Cloud Scheduler Invoker"
 if [[ "$CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL" != "$SCHEDULER_SA" ]]; then
   ensure_service_account "$CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL" "Medical Chatbot Cloud Tasks Invoker"
 fi
 
+echo "[deploy] granting project IAM roles"
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:${RUN_SA}" \
   --role="roles/cloudtasks.enqueuer" >/dev/null
@@ -177,6 +210,12 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:${RUN_SA}" \
   --role="roles/datastore.user" >/dev/null
 
+echo "[deploy] granting Cloud Run builder role to build service account: ${BUILD_SERVICE_ACCOUNT_EMAIL}"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:${BUILD_SERVICE_ACCOUNT_EMAIL}" \
+  --role="roles/run.builder" >/dev/null
+
+echo "[deploy] granting Secret Manager access"
 grant_secret_access "$GEMINI_SECRET_NAME"
 require_secret_exists "$UPLOAD_TOKEN_SECRET_NAME"
 grant_secret_access "$UPLOAD_TOKEN_SECRET_NAME"
@@ -187,23 +226,29 @@ fi
 
 # Required when Cloud Tasks uses CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL for OIDC.
 # Without this, create_task fails with iam.serviceAccounts.actAs PERMISSION_DENIED.
+echo "[deploy] granting Cloud Tasks service account impersonation"
 gcloud iam service-accounts add-iam-policy-binding "$CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL" \
   --project "$PROJECT_ID" \
   --member="serviceAccount:${RUN_SA}" \
   --role="roles/iam.serviceAccountUser" >/dev/null
 
+echo "[deploy] ensuring Cloud Tasks queues"
 if ! gcloud tasks queues describe "$CALLBACK_TASKS_QUEUE_NAME" --location "$CLOUD_TASKS_LOCATION" --project "$PROJECT_ID" >/dev/null 2>&1; then
+  echo "[deploy] creating Cloud Tasks queue: ${CALLBACK_TASKS_QUEUE_NAME}"
   gcloud tasks queues create "$CALLBACK_TASKS_QUEUE_NAME" --location "$CLOUD_TASKS_LOCATION" --project "$PROJECT_ID" >/dev/null
 fi
 
 if ! gcloud tasks queues describe "$PREWARM_TASKS_QUEUE_NAME" --location "$CLOUD_TASKS_LOCATION" --project "$PROJECT_ID" >/dev/null 2>&1; then
+  echo "[deploy] creating Cloud Tasks queue: ${PREWARM_TASKS_QUEUE_NAME}"
   gcloud tasks queues create "$PREWARM_TASKS_QUEUE_NAME" --location "$CLOUD_TASKS_LOCATION" --project "$PROJECT_ID" >/dev/null
 fi
 
 if ! gcloud tasks queues describe "$WIKI_REBUILD_TASKS_QUEUE_NAME" --location "$CLOUD_TASKS_LOCATION" --project "$PROJECT_ID" >/dev/null 2>&1; then
+  echo "[deploy] creating Cloud Tasks queue: ${WIKI_REBUILD_TASKS_QUEUE_NAME}"
   gcloud tasks queues create "$WIKI_REBUILD_TASKS_QUEUE_NAME" --location "$CLOUD_TASKS_LOCATION" --project "$PROJECT_ID" >/dev/null
 fi
 
+echo "[deploy] configuring Cloud Tasks queue limits"
 configure_tasks_queue "$CALLBACK_TASKS_QUEUE_NAME" \
   "$CALLBACK_TASKS_MAX_DISPATCHES_PER_SECOND" \
   "$CALLBACK_TASKS_MAX_CONCURRENT_DISPATCHES" \
@@ -236,7 +281,9 @@ if [[ "$CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL" != "$SCHEDULER_SA" ]]; then
   ALLOWED_EMAILS="${ALLOWED_EMAILS},${CLOUD_TASKS_SERVICE_ACCOUNT_EMAIL}"
 fi
 
-ENV_VARS="FIRESTORE_PROJECT_ID=${PROJECT_ID}"
+ENV_VARS="APP_ENV=${APP_ENV}"
+ENV_VARS+=",APP_NAME=${APP_NAME}"
+ENV_VARS+=",FIRESTORE_PROJECT_ID=${PROJECT_ID}"
 ENV_VARS+=",FIRESTORE_DATABASE_ID=${FIRESTORE_DATABASE_ID}"
 ENV_VARS+=",DRIVE_CHANGES_SCOPE_ID=main"
 if [[ -n "${GOOGLE_DRIVE_ROOT_FOLDER_ID:-}" ]]; then
@@ -320,6 +367,7 @@ if [[ "$ADMIN_DASHBOARD_ENABLED" == "true" ]]; then
   SET_SECRETS="${SET_SECRETS},ADMIN_DASHBOARD_PASSWORD=${ADMIN_DASHBOARD_PASSWORD_SECRET_NAME}:latest"
 fi
 
+echo "[deploy] deploying Cloud Run service: ${SERVICE_NAME}"
 gcloud run deploy "$SERVICE_NAME" \
   --quiet \
   --source . \
@@ -327,9 +375,11 @@ gcloud run deploy "$SERVICE_NAME" \
   --allow-unauthenticated \
   --service-account "$RUN_SA" \
   --timeout "$CLOUD_RUN_TIMEOUT_SECONDS" \
-  --memory 1Gi \
-  --cpu 1 \
-  --min-instances 1 \
+  --memory "$CLOUD_RUN_MEMORY" \
+  --cpu "$CLOUD_RUN_CPU" \
+  --min-instances "$CLOUD_RUN_MIN_INSTANCES" \
+  --max-instances "$CLOUD_RUN_MAX_INSTANCES" \
+  --concurrency "$CLOUD_RUN_CONCURRENCY" \
   --set-env-vars "$ENV_VARS" \
   --set-secrets "$SET_SECRETS"
 
@@ -338,11 +388,13 @@ SERVICE_URL=$(gcloud run services describe "$SERVICE_NAME" \
   --format='value(status.url)')
 
 # The app verifies the OIDC aud claim against this exact value.
+echo "[deploy] updating Cloud Run runtime URLs"
 gcloud run services update "$SERVICE_NAME" \
   --quiet \
   --region "$REGION" \
   --update-env-vars "ADMIN_OIDC_AUDIENCE=${SERVICE_URL},CLOUD_TASKS_BASE_URL=${SERVICE_URL},CLOUD_TASKS_AUDIENCE=${SERVICE_URL},UPLOAD_BASE_URL=${SERVICE_URL}"
 
+echo "[deploy] granting Cloud Run invoker roles"
 gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
   --quiet \
   --region "$REGION" \
@@ -360,10 +412,12 @@ upsert_scheduler_job() {
   local uri="$2"
   local schedule="$3"
 
+  echo "[deploy] configuring Cloud Scheduler job: ${job_name}"
   if gcloud scheduler jobs describe "$job_name" --location "$REGION" >/dev/null 2>&1; then
     gcloud scheduler jobs update http "$job_name" \
       --location "$REGION" \
       --schedule "$schedule" \
+      --time-zone "$SCHEDULER_TIME_ZONE" \
       --uri "$uri" \
       --http-method POST \
       --oidc-service-account-email "$SCHEDULER_SA" \
@@ -372,32 +426,52 @@ upsert_scheduler_job() {
     gcloud scheduler jobs create http "$job_name" \
       --location "$REGION" \
       --schedule "$schedule" \
+      --time-zone "$SCHEDULER_TIME_ZONE" \
       --uri "$uri" \
       --http-method POST \
       --oidc-service-account-email "$SCHEDULER_SA" \
       --oidc-token-audience "$SERVICE_URL"
   fi
+  gcloud scheduler jobs resume "$job_name" \
+    --project "$PROJECT_ID" \
+    --location "$REGION" >/dev/null || true
 }
 
-upsert_scheduler_job \
-  "$DRIVE_CHANGES_JOB_NAME" \
-  "${SERVICE_URL}/admin/sync-drive-changes" \
-  "* * * * *"
+if [[ "$CREATE_SCHEDULER_JOBS" == "true" ]]; then
+  echo "[deploy] configuring Cloud Scheduler jobs"
+  upsert_scheduler_job \
+    "$DRIVE_CHANGES_JOB_NAME" \
+    "${SERVICE_URL}/admin/sync-drive-changes" \
+    "* * * * *"
 
-upsert_scheduler_job \
-  "$FULL_SYNC_JOB_NAME" \
-  "${SERVICE_URL}/admin/sync-drive" \
-  "0 3 * * *"
+  upsert_scheduler_job \
+    "$FULL_SYNC_JOB_NAME" \
+    "${SERVICE_URL}/admin/sync-drive" \
+    "0 3 * * *"
 
-upsert_scheduler_job \
-  "$CALLBACK_JOBS_JOB_NAME" \
-  "${SERVICE_URL}/admin/process-callback-jobs" \
-  "* * * * *"
+  if [[ "${CALLBACK_WORKER_MODE:-cloud_tasks}" == "cloud_tasks" ]]; then
+    if gcloud scheduler jobs describe "$CALLBACK_JOBS_JOB_NAME" \
+      --project "$PROJECT_ID" \
+      --location "$REGION" >/dev/null 2>&1; then
+      gcloud scheduler jobs pause "$CALLBACK_JOBS_JOB_NAME" \
+        --project "$PROJECT_ID" \
+        --location "$REGION" >/dev/null || true
+      echo "Paused ${CALLBACK_JOBS_JOB_NAME} because CALLBACK_WORKER_MODE=cloud_tasks."
+    fi
+  else
+    upsert_scheduler_job \
+      "$CALLBACK_JOBS_JOB_NAME" \
+      "${SERVICE_URL}/admin/process-callback-jobs" \
+      "* * * * *"
+  fi
 
-upsert_scheduler_job \
-  "$GEMINI_FILES_CLEANUP_JOB_NAME" \
-  "${SERVICE_URL}/admin/cleanup-gemini-files" \
-  "*/30 * * * *"
+  upsert_scheduler_job \
+    "$GEMINI_FILES_CLEANUP_JOB_NAME" \
+    "${SERVICE_URL}/admin/cleanup-gemini-files" \
+    "*/30 * * * *"
+else
+  echo "[deploy] CREATE_SCHEDULER_JOBS=false, skipping Cloud Scheduler jobs."
+fi
 
 pause_scheduler_job_if_exists "$LEGACY_CHAT_LOG_EXPORT_JOB_NAME"
 
@@ -409,12 +483,35 @@ if [[ "$DEPLOY_FIRESTORE_INDEXES" == "true" ]]; then
   fi
 fi
 
+if [[ "$RUN_FULL_SYNC_AFTER_DEPLOY" == "true" ]]; then
+  echo "[deploy] running one-time post-deploy full Drive sync"
+  if [[ "$CREATE_SCHEDULER_JOBS" == "true" ]]; then
+    gcloud scheduler jobs run "$FULL_SYNC_JOB_NAME" \
+      --project "$PROJECT_ID" \
+      --location "$REGION"
+  else
+    TOKEN="$(gcloud auth print-identity-token \
+      --impersonate-service-account="${SCHEDULER_SA}" \
+      --audiences="${SERVICE_URL}" \
+      --include-email)"
+    curl -fsS -X POST "${SERVICE_URL}/admin/sync-drive" \
+      -H "Authorization: Bearer ${TOKEN}"
+    echo
+  fi
+fi
+
 echo "Deployed ${SERVICE_NAME}: ${SERVICE_URL}"
+echo "App env/name: ${APP_ENV}/${APP_NAME}"
 echo "Firestore database: ${FIRESTORE_DATABASE_ID}"
 echo "Firestore indexes ensured: ${ENSURE_FIRESTORE_INDEXES}"
+echo "Scheduler jobs enabled: ${CREATE_SCHEDULER_JOBS}"
+echo "Scheduler time zone: ${SCHEDULER_TIME_ZONE}"
+echo "Full sync schedule: 0 3 * * * (${SCHEDULER_TIME_ZONE})"
+echo "Post-deploy full sync run: ${RUN_FULL_SYNC_AFTER_DEPLOY}"
 echo "Admin OIDC audience: ${SERVICE_URL}"
 echo "Allowed admin caller: ${ALLOWED_EMAILS}"
 echo "Cloud Run timeout seconds: ${CLOUD_RUN_TIMEOUT_SECONDS}"
+echo "Cloud Run resources: cpu=${CLOUD_RUN_CPU}, memory=${CLOUD_RUN_MEMORY}, min=${CLOUD_RUN_MIN_INSTANCES}, max=${CLOUD_RUN_MAX_INSTANCES}, concurrency=${CLOUD_RUN_CONCURRENCY}"
 echo "Upload base URL: ${SERVICE_URL}"
 echo "Upload token secret: ${UPLOAD_TOKEN_SECRET_NAME}"
 echo "Callback Cloud Tasks queue: ${CALLBACK_TASKS_QUEUE_NAME}"

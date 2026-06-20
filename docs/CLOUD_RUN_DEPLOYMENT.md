@@ -131,13 +131,48 @@ CHAT_ATTACHMENT_TTL_MINUTES=60
 MAX_UPLOAD_FILE_BYTES=20971520
 ```
 
+카카오 즉시 응답 경로가 Drive sync, Wiki rebuild, prewarm 작업과 같은 Cloud Run service를 공유하므로 운영 배포 기본값은 아래처럼 사용자 요청 지연을 줄이는 쪽으로 잡습니다. 필요하면 `.env` 또는 shell env로 override할 수 있습니다.
+
+```env
+CLOUD_RUN_CPU=2
+CLOUD_RUN_MEMORY=2Gi
+CLOUD_RUN_MIN_INSTANCES=2
+CLOUD_RUN_MAX_INSTANCES=12
+CLOUD_RUN_CONCURRENCY=20
+WIKI_REBUILD_TASKS_MAX_DISPATCHES_PER_SECOND=0.2
+WIKI_REBUILD_TASKS_MAX_CONCURRENT_DISPATCHES=1
+```
+
 ```bash
 ./scripts/deploy-test.sh
 ```
 
+Cloud Scheduler job은 `SCHEDULER_TIME_ZONE` 기준으로 생성 또는 갱신됩니다. 기본값은 `Asia/Seoul`이며, full sync는 `0 3 * * *` 스케줄이므로 기본 설정에서는 매일 한국 시간 03:00에 `/admin/sync-drive`가 실행됩니다.
+
 운영 `deploy.sh`에서 관리자 대시보드를 활성화하려면 `ADMIN_DASHBOARD_ENABLED=true`와 함께 `ADMIN_DASHBOARD_PASSWORD_SECRET_NAME`에 해당하는 Secret Manager secret이 미리 존재해야 합니다. 운영 배포 스크립트는 비밀번호 값을 `.env`에서 읽어 secret을 생성하지 않습니다.
 
 `LEGACY_CHAT_LOG_EXPORT_JOB_NAME`은 이전 채팅 로그 Drive export Scheduler가 남아 있는 환경에서 pause할 대상 이름입니다. 현재 코드는 Drive CSV export endpoint와 worker를 제공하지 않으므로, 이 변수로 새 export job을 만들지 않습니다.
+
+정식 운영 배포에서 새 Firestore database이거나 `patients`, `drive_file_index`, `medical_sources`가 비어 있는 상태라면 변경분 sync만으로 기존 Drive 파일 전체가 생성되지 않습니다. 이 경우 배포 직후 초기 전체 연동까지 실행합니다.
+
+```bash
+RUN_FULL_SYNC_AFTER_DEPLOY=true ./deploy.sh
+```
+
+평상시 코드 수정 배포에서는 기존처럼 실행합니다.
+
+```bash
+./deploy.sh
+```
+
+`deploy.sh`의 기본 Scheduler 설정:
+
+```text
+SCHEDULER_TIME_ZONE=Asia/Seoul
+DRIVE_CHANGES_JOB_NAME: * * * * * → /admin/sync-drive-changes
+FULL_SYNC_JOB_NAME: 0 3 * * * → /admin/sync-drive
+GEMINI_FILES_CLEANUP_JOB_NAME: */30 * * * * → /admin/cleanup-gemini-files
+```
 
 ### 3.2 Health check
 

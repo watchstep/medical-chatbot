@@ -136,7 +136,7 @@ class FirestoreChatbotCloudTasksTest(unittest.TestCase):
         self.assertIsNotNone(stored)
         self.assertEqual(stored.status, "PENDING")
 
-    def test_enqueue_failure_still_returns_ack_and_leaves_job_for_polling_fallback(self) -> None:
+    def test_enqueue_failure_returns_simple_error_and_marks_job_failed(self) -> None:
         self.chatbot.callback_task_enqueue_service = FakeCallbackTaskEnqueueService(fail=True)  # type: ignore[assignment]
         background_tasks = BackgroundTasks()
 
@@ -145,11 +145,13 @@ class FirestoreChatbotCloudTasksTest(unittest.TestCase):
         )
 
         self.assertEqual(response["version"], "2.0")
+        text = response["template"]["outputs"][0]["simpleText"]["text"]
+        self.assertIn("현재 답변 서비스 이용이 원활하지 않습니다", text)
         self.assertEqual(len(background_tasks.tasks), 0)
         jobs = list(self.repository.callback_jobs.values())
         self.assertEqual(len(jobs), 1)
-        self.assertEqual(jobs[0].status, "PENDING")
-        self.assertTrue(jobs[0].runnable)
+        self.assertEqual(jobs[0].status, "FAILED")
+        self.assertFalse(jobs[0].runnable)
 
     def test_upload_command_returns_link_but_redacts_assistant_chat_log(self) -> None:
         background_tasks = BackgroundTasks()
@@ -186,6 +188,44 @@ class FirestoreChatbotCloudTasksTest(unittest.TestCase):
         text = response["template"]["outputs"][0]["simpleText"]["text"]
         self.assertIn(self.temporary_service.link_url, text)
         self.assertEqual(self.enqueue_service.calls, [])
+
+    def test_upload_command_does_not_initialize_worker_factories(self) -> None:
+        factory_calls: list[str] = []
+        chatbot = FirestoreChatbotService(
+            settings=self.settings,
+            repository=self.repository,
+            callback_task_enqueue_service_factory=lambda: factory_calls.append("callback") or self.enqueue_service,
+            prewarm_enqueue_service_factory=lambda: factory_calls.append("prewarm") or None,
+            temporary_attachment_service=self.temporary_service,  # type: ignore[arg-type]
+        )
+        background_tasks = BackgroundTasks()
+
+        response = asyncio.run(
+            chatbot.handle_chat(skill_request(utterance="파일 업로드", callback_url=None), background_tasks)
+        )
+
+        text = response["template"]["outputs"][0]["simpleText"]["text"]
+        self.assertIn(self.temporary_service.link_url, text)
+        self.assertEqual(factory_calls, [])
+        self.assertEqual(background_tasks.tasks, [])
+
+    def test_callback_question_initializes_callback_factory_lazily(self) -> None:
+        factory_calls: list[str] = []
+        chatbot = FirestoreChatbotService(
+            settings=self.settings,
+            repository=self.repository,
+            callback_task_enqueue_service_factory=lambda: factory_calls.append("callback") or self.enqueue_service,
+            temporary_attachment_service=self.temporary_service,  # type: ignore[arg-type]
+        )
+        background_tasks = BackgroundTasks()
+
+        response = asyncio.run(
+            chatbot.handle_chat(skill_request(utterance="검사 결과 알려줘"), background_tasks)
+        )
+
+        self.assertEqual(response["version"], "2.0")
+        self.assertEqual(factory_calls, ["callback"])
+        self.assertEqual(len(self.enqueue_service.calls), 1)
 
     def test_auth_entry_upload_command_returns_link_for_authenticated_user(self) -> None:
         background_tasks = BackgroundTasks()

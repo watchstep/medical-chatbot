@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 from datetime import datetime, timedelta, timezone
 
 from fastapi import BackgroundTasks
@@ -155,7 +156,9 @@ class FirestoreChatbotService:
     repository: MedicalRepository
     callback_job_processor: "CallbackJobProcessor | None" = None
     callback_task_enqueue_service: CallbackTaskEnqueueService | None = None
+    callback_task_enqueue_service_factory: Callable[[], CallbackTaskEnqueueService | None] | None = None
     prewarm_enqueue_service: GeminiFilePrewarmEnqueueService | None = None
+    prewarm_enqueue_service_factory: Callable[[], GeminiFilePrewarmEnqueueService | None] | None = None
     temporary_attachment_service: TemporaryAttachmentService | None = None
     session_ttl_minutes: int = 1440
 
@@ -164,28 +167,42 @@ class FirestoreChatbotService:
         payload: KakaoSkillRequest,
         background_tasks: BackgroundTasks,
     ) -> dict:
-        del background_tasks
+        started_at = time.monotonic()
         user_id = payload.user_request.user.id
         utterance = payload.user_request.utterance.strip()
         kakao_user_id_hash = hash_kakao_user_id(user_id)
 
         if self._is_auth_reset_command(utterance):
             self._reset_auth(kakao_user_id_hash)
+            self._log_kakao_route_timing(route="auth_reset", started_at=started_at, status="ok")
             return build_simple_text_response(AUTH_RESET_MESSAGE)
 
         if utterance.startswith(AUTH_PREFIX):
-            return self._handle_auth(kakao_user_id_hash=kakao_user_id_hash, utterance=utterance)
+            response = self._handle_auth(
+                kakao_user_id_hash=kakao_user_id_hash,
+                utterance=utterance,
+                background_tasks=background_tasks,
+            )
+            self._log_kakao_route_timing(route="auth", started_at=started_at, status="ok")
+            return response
 
         patient = self._resolve_patient(kakao_user_id_hash)
         if patient is None:
+            self._log_kakao_route_timing(route="auth_entry_unmapped", started_at=started_at, status="ok")
             return build_simple_text_response(UNMAPPED_USER_MESSAGE)
         if self._is_upload_command(utterance):
             answer_text, _ = self._build_upload_link_response(
                 patient_id=patient.patient_id,
                 kakao_user_id_hash=kakao_user_id_hash,
             )
+            self._log_kakao_route_timing(route="upload_command", started_at=started_at, status="ok")
             return build_simple_text_response(answer_text)
-        self._try_enqueue_prewarm(patient_id=patient.patient_id, reason="authenticated_start")
+        self._schedule_prewarm(
+            patient_id=patient.patient_id,
+            reason="authenticated_start",
+            background_tasks=background_tasks,
+        )
+        self._log_kakao_route_timing(route="authenticated_start", started_at=started_at, status="ok")
         return build_simple_text_response(
             AUTHENTICATED_START_BLOCK_MESSAGE.format(patient_name=patient.name)
         )
@@ -195,6 +212,7 @@ class FirestoreChatbotService:
         payload: KakaoSkillRequest,
         background_tasks: BackgroundTasks,
     ) -> dict:
+        started_at = time.monotonic()
         user_id = payload.user_request.user.id
         utterance = payload.user_request.utterance.strip()
         callback_url = payload.user_request.callback_url
@@ -202,12 +220,20 @@ class FirestoreChatbotService:
 
         if self._is_auth_reset_command(utterance):
             self._reset_auth(kakao_user_id_hash)
+            self._log_kakao_route_timing(route="auth_reset", started_at=started_at, status="ok")
             return build_simple_text_response(AUTH_RESET_MESSAGE)
         if utterance.startswith(AUTH_PREFIX):
-            return self._handle_auth(kakao_user_id_hash=kakao_user_id_hash, utterance=utterance)
+            response = self._handle_auth(
+                kakao_user_id_hash=kakao_user_id_hash,
+                utterance=utterance,
+                background_tasks=background_tasks,
+            )
+            self._log_kakao_route_timing(route="auth", started_at=started_at, status="ok")
+            return response
 
         patient = self._resolve_patient(kakao_user_id_hash)
         if patient is None:
+            self._log_kakao_route_timing(route="unmapped", started_at=started_at, status="ok")
             return build_simple_text_response(UNMAPPED_USER_MESSAGE)
 
         chat_log_id = self._create_chat_log(
@@ -229,10 +255,15 @@ class FirestoreChatbotService:
                 message_type="system",
                 related_log_id=chat_log_id,
             )
+            self._log_kakao_route_timing(route="upload_command", started_at=started_at, status="ok")
             return build_simple_text_response(answer_text)
 
         if self._is_latest_record_intent(utterance):
-            self._try_enqueue_prewarm(patient_id=patient.patient_id, reason="medical_record_lookup")
+            self._schedule_prewarm(
+                patient_id=patient.patient_id,
+                reason="medical_record_lookup",
+                background_tasks=background_tasks,
+            )
             answer_text = self._latest_record_message(patient.patient_id)
             self._create_assistant_chat_log(
                 patient=patient,
@@ -241,6 +272,7 @@ class FirestoreChatbotService:
                 message_type="system",
                 related_log_id=chat_log_id,
             )
+            self._log_kakao_route_timing(route="latest_record", started_at=started_at, status="ok")
             return build_simple_text_response(answer_text)
 
         answer_route = "drive"
@@ -262,6 +294,11 @@ class FirestoreChatbotService:
                     message_type="system",
                     related_log_id=chat_log_id,
                 )
+                self._log_kakao_route_timing(
+                    route="temporary_attachment_missing",
+                    started_at=started_at,
+                    status="ok",
+                )
                 return build_simple_text_response(UPLOAD_ATTACHMENT_MISSING_MESSAGE)
             answer_route = "temporary_attachment"
             attachment_id = attachment.attachment_id
@@ -274,6 +311,7 @@ class FirestoreChatbotService:
                 message_type="system",
                 related_log_id=chat_log_id,
             )
+            self._log_kakao_route_timing(route="callback_unavailable", started_at=started_at, status="ok")
             return build_simple_text_response(CALLBACK_UNAVAILABLE_MESSAGE)
 
         now = datetime.now(KST)
@@ -289,6 +327,7 @@ class FirestoreChatbotService:
         existing_job = self.repository.get_callback_job_by_idempotency_key(idempotency_key)
         if existing_job is not None and existing_job.status in {"PENDING", "PROCESSING"}:
             self.repository.update_chat_log_job(patient.patient_id, chat_log_id, existing_job.job_id)
+            self._log_kakao_route_timing(route="callback_ack_deduped", started_at=started_at, status="ok")
             return build_callback_ack_response()
 
         job_id = f"JOB_{uuid.uuid4().hex[:12].upper()}"
@@ -320,15 +359,45 @@ class FirestoreChatbotService:
                 related_log_id=chat_log_id,
                 job_id=job_id,
             )
+            self._log_kakao_route_timing(route="callback_dispatch_failed", started_at=started_at, status="error")
             return build_simple_text_response(CALLBACK_UNAVAILABLE_MESSAGE)
+        self._log_kakao_route_timing(route="callback_ack", started_at=started_at, status="ok")
         return build_callback_ack_response()
+
+    def _log_kakao_route_timing(self, *, route: str, started_at: float, status: str) -> None:
+        logger.info(
+            "kakao_request route=%s status=%s duration_ms=%d",
+            route,
+            status,
+            int((time.monotonic() - started_at) * 1000),
+        )
+
+    def _get_prewarm_enqueue_service(self) -> GeminiFilePrewarmEnqueueService | None:
+        if self.prewarm_enqueue_service is None and self.prewarm_enqueue_service_factory is not None:
+            self.prewarm_enqueue_service = self.prewarm_enqueue_service_factory()
+        return self.prewarm_enqueue_service
+
+    def _get_callback_task_enqueue_service(self) -> CallbackTaskEnqueueService | None:
+        if self.callback_task_enqueue_service is None and self.callback_task_enqueue_service_factory is not None:
+            self.callback_task_enqueue_service = self.callback_task_enqueue_service_factory()
+        return self.callback_task_enqueue_service
+
+    def _schedule_prewarm(
+        self,
+        *,
+        patient_id: str,
+        reason: str,
+        background_tasks: BackgroundTasks,
+    ) -> None:
+        background_tasks.add_task(self._try_enqueue_prewarm, patient_id=patient_id, reason=reason)
 
     def _try_enqueue_prewarm(self, *, patient_id: str, reason: str) -> None:
         """Best-effort latency optimization. Failures must not affect user-facing responses."""
-        if self.prewarm_enqueue_service is None:
+        prewarm_enqueue_service = self._get_prewarm_enqueue_service()
+        if prewarm_enqueue_service is None:
             return
         try:
-            result = self.prewarm_enqueue_service.enqueue_latest_source(
+            result = prewarm_enqueue_service.enqueue_latest_source(
                 patient_id=patient_id,
                 reason=reason,
             )
@@ -375,7 +444,8 @@ class FirestoreChatbotService:
 
     def _enqueue_callback_task(self, job: KakaoCallbackJob) -> bool:
         job_id = job.job_id
-        if self.callback_task_enqueue_service is None:
+        callback_task_enqueue_service = self._get_callback_task_enqueue_service()
+        if callback_task_enqueue_service is None:
             logger.error("callback cloud task enqueue service unavailable job_id=%s", job_id)
             self._mark_callback_dispatch_failed(
                 job,
@@ -384,7 +454,7 @@ class FirestoreChatbotService:
             )
             return False
         try:
-            result = self.callback_task_enqueue_service.enqueue_callback_job(job_id=job_id)
+            result = callback_task_enqueue_service.enqueue_callback_job(job_id=job_id)
             logger.info(
                 "callback cloud task dispatch job_id=%s task_name=%s duplicate=%s",
                 job_id,
@@ -466,7 +536,13 @@ class FirestoreChatbotService:
         )
         return text, UPLOAD_LINK_LOG_MESSAGE
 
-    def _handle_auth(self, *, kakao_user_id_hash: str, utterance: str) -> dict:
+    def _handle_auth(
+        self,
+        *,
+        kakao_user_id_hash: str,
+        utterance: str,
+        background_tasks: BackgroundTasks,
+    ) -> dict:
         tokens = utterance.split()
         if len(tokens) != 3:
             return build_simple_text_response(INVALID_AUTH_FORMAT_MESSAGE)
@@ -498,7 +574,11 @@ class FirestoreChatbotService:
                 expires_at=(now + timedelta(minutes=self.session_ttl_minutes)).isoformat(),
             )
         )
-        self._try_enqueue_prewarm(patient_id=patient.patient_id, reason="auth_success")
+        self._schedule_prewarm(
+            patient_id=patient.patient_id,
+            reason="auth_success",
+            background_tasks=background_tasks,
+        )
         return build_simple_text_response(AUTH_SUCCESS_MESSAGE.format(patient_name=patient.name))
 
     def _resolve_patient(self, kakao_user_id_hash: str) -> PatientProfile | None:

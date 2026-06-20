@@ -369,7 +369,26 @@ class DriveChangesSyncService:
     def rebuild_wiki_page(self, *, patient_id: str, source_id: str) -> dict[str, object]:
         deadline = time.monotonic() + self.settings.async_worker_processing_timeout_seconds
         self._ensure_async_worker_budget(deadline)
-        page = self.wiki_service.rebuild_wiki_page(patient_id=patient_id, source_id=source_id)
+        source = self.repository.get_medical_source(patient_id, source_id)
+        runtime = self.repository.get_source_runtime(patient_id, source_id)
+        if source is None:
+            raise ValueError(f"source not found: {patient_id}/{source_id}")
+        if runtime is None:
+            runtime = MedicalSourceRuntime(source_id=source_id, patient_id=patient_id)
+
+        try:
+            page = self.wiki_service.rebuild_wiki_page(patient_id=patient_id, source_id=source_id)
+        except MedicalWikiExtractionError as exc:
+            self._mark_wiki_page_failed(
+                patient_id=patient_id,
+                source_id=source_id,
+                source=source,
+                runtime=runtime,
+                error=exc,
+            )
+            self.wiki_service.compile_wiki_index(patient_id=patient_id)
+            raise
+
         self._ensure_async_worker_budget(deadline, reserve_seconds=5.0)
         source = self.repository.get_medical_source(patient_id, source_id)
         runtime = self.repository.get_source_runtime(patient_id, source_id)

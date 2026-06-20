@@ -44,6 +44,7 @@ from app.services.admin_dashboard import (
 )
 from app.services.medical_wiki import MedicalWikiService
 from app.services.medical_wiki_extractor import (
+    MedicalWikiExtractionError,
     MedicalWikiExtractor,
     build_default_medical_wiki_extractor,
 )
@@ -341,7 +342,13 @@ def create_app(
         sync_service = _get_or_init_drive_changes_sync_service(request)
         if sync_service is None:
             return {"ok": False, "error": "sync service unavailable"}
-        return sync_service.rebuild_wiki_page(patient_id=patient_id, source_id=source_id)
+        try:
+            return sync_service.rebuild_wiki_page(patient_id=patient_id, source_id=source_id)
+        except MedicalWikiExtractionError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"ok": False, "error": "wiki page rebuild failed"},
+            ) from exc
 
     @app.post("/admin/recompile-wiki-index/{patient_id}")
     async def admin_recompile_wiki_index(patient_id: str, request: Request) -> dict:
@@ -1153,7 +1160,7 @@ def _get_or_init_firestore_chatbot_service(request: Request) -> FirestoreChatbot
         return None
 
     callback_job_processor = None
-    callback_task_enqueue_service = None
+    callback_task_enqueue_service_factory = None
 
     # Keep the Kakao Skill path lightweight.
     # In cloud_tasks and polling modes, /kakao/chat only persists a durable Firestore job
@@ -1162,14 +1169,14 @@ def _get_or_init_firestore_chatbot_service(request: Request) -> FirestoreChatbot
     if request.app.state.settings.callback_worker_mode == "background":
         callback_job_processor = _get_or_init_callback_job_processor(request)
     elif request.app.state.settings.callback_worker_mode == "cloud_tasks":
-        callback_task_enqueue_service = _get_or_init_callback_task_enqueue_service(request)
+        callback_task_enqueue_service_factory = lambda: _get_or_init_callback_task_enqueue_service(request)
 
     request.app.state.firestore_chatbot_service = FirestoreChatbotService(
         settings=request.app.state.settings,
         repository=repository,
         callback_job_processor=callback_job_processor,
-        callback_task_enqueue_service=callback_task_enqueue_service,
-        prewarm_enqueue_service=_get_or_init_gemini_file_prewarm_enqueue_service(request),
+        callback_task_enqueue_service_factory=callback_task_enqueue_service_factory,
+        prewarm_enqueue_service_factory=lambda: _get_or_init_gemini_file_prewarm_enqueue_service(request),
         temporary_attachment_service=_get_or_init_temporary_attachment_service(request),
         session_ttl_minutes=request.app.state.settings.session_ttl_minutes,
     )

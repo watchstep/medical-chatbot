@@ -9,6 +9,7 @@ from app.services.cloud_tasks import CloudTaskEnqueueResult
 from app.services.drive import DriveGateway
 from app.services.drive_sync import DriveChangesSyncService
 from app.services.medical_wiki import MedicalWikiService
+from app.services.medical_wiki_extractor import MedicalWikiExtractionError
 
 
 class FakeDriveGateway(DriveGateway):
@@ -56,6 +57,11 @@ class FakeWikiRebuildTaskEnqueueService:
         return CloudTaskEnqueueResult(task_name=f"tasks/{source_id}", duplicate=False)
 
 
+class FailingWikiService(MedicalWikiService):
+    def rebuild_wiki_page(self, *, patient_id: str, source_id: str):  # type: ignore[override]
+        raise MedicalWikiExtractionError("forced wiki extraction failure")
+
+
 class DriveSyncWikiTasksTest(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = Settings(
@@ -97,6 +103,35 @@ class DriveSyncWikiTasksTest(unittest.TestCase):
         assert runtime is not None
         self.assertEqual(runtime.sync.status, "WIKI_PROCESSING")
         self.assertEqual(runtime.wiki_sync.status, "WIKI_PROCESSING")
+        self.assertIsNone(self.repository.get_wiki_page_by_source("P0001", source.source_id))
+
+    def test_rebuild_wiki_page_failure_marks_runtime_failed_and_keeps_empty_index(self) -> None:
+        self.sync_service.sync_patient("P0001")
+        source = self.repository.list_medical_sources("P0001")[0]
+        self.sync_service.wiki_service = FailingWikiService(
+            repository=self.repository,
+            settings=self.settings,
+        )
+
+        with self.assertRaises(MedicalWikiExtractionError):
+            self.sync_service.rebuild_wiki_page(
+                patient_id="P0001",
+                source_id=source.source_id,
+            )
+
+        failed_source = self.repository.get_medical_source("P0001", source.source_id)
+        runtime = self.repository.get_source_runtime("P0001", source.source_id)
+        index = self.repository.get_wiki_index("P0001")
+        assert failed_source is not None
+        assert runtime is not None
+        assert index is not None
+        self.assertEqual(failed_source.source_status, "STALE")
+        self.assertEqual(runtime.sync.status, "FAILED")
+        self.assertEqual(runtime.wiki_sync.status, "FAILED")
+        self.assertIsNotNone(runtime.sync.last_failure)
+        assert runtime.sync.last_failure is not None
+        self.assertEqual(runtime.sync.last_failure.code, "WIKI_PAGE_GENERATION_FAILED")
+        self.assertEqual(len(index.pages), 0)
         self.assertIsNone(self.repository.get_wiki_page_by_source("P0001", source.source_id))
 
 

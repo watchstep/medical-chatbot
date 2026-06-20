@@ -8,6 +8,7 @@ FIRESTORE_DATABASE_ID="${FIRESTORE_DATABASE_ID:-medical-chatbot-test}"
 DEPLOY_FIRESTORE_INDEXES="${DEPLOY_FIRESTORE_INDEXES:-false}"
 ENSURE_FIRESTORE_INDEXES="${ENSURE_FIRESTORE_INDEXES:-true}"
 CREATE_SCHEDULER_JOBS="${CREATE_SCHEDULER_JOBS:-true}"
+SCHEDULER_TIME_ZONE="${SCHEDULER_TIME_ZONE:-Asia/Seoul}"
 
 RUN_SA="${RUN_SA:-medical-chatbot-test-run@${PROJECT_ID}.iam.gserviceaccount.com}"
 SCHEDULER_SA="${SCHEDULER_SA:-medical-chatbot-test-scheduler@${PROJECT_ID}.iam.gserviceaccount.com}"
@@ -25,6 +26,11 @@ CALLBACK_TASKS_DISPATCH_DEADLINE_SECONDS="${CALLBACK_TASKS_DISPATCH_DEADLINE_SEC
 GEMINI_FILE_PREWARM_DISPATCH_DEADLINE_SECONDS="${GEMINI_FILE_PREWARM_DISPATCH_DEADLINE_SECONDS:-600}"
 WIKI_REBUILD_TASKS_DISPATCH_DEADLINE_SECONDS="${WIKI_REBUILD_TASKS_DISPATCH_DEADLINE_SECONDS:-600}"
 CLOUD_RUN_TIMEOUT_SECONDS="${CLOUD_RUN_TIMEOUT_SECONDS:-900}"
+CLOUD_RUN_MEMORY="${CLOUD_RUN_MEMORY:-2Gi}"
+CLOUD_RUN_CPU="${CLOUD_RUN_CPU:-2}"
+CLOUD_RUN_MIN_INSTANCES="${CLOUD_RUN_MIN_INSTANCES:-1}"
+CLOUD_RUN_MAX_INSTANCES="${CLOUD_RUN_MAX_INSTANCES:-8}"
+CLOUD_RUN_CONCURRENCY="${CLOUD_RUN_CONCURRENCY:-20}"
 
 CALLBACK_TASKS_MAX_DISPATCHES_PER_SECOND="${CALLBACK_TASKS_MAX_DISPATCHES_PER_SECOND:-2}"
 CALLBACK_TASKS_MAX_CONCURRENT_DISPATCHES="${CALLBACK_TASKS_MAX_CONCURRENT_DISPATCHES:-5}"
@@ -42,8 +48,8 @@ PREWARM_TASKS_MAX_BACKOFF="${PREWARM_TASKS_MAX_BACKOFF:-300s}"
 PREWARM_TASKS_MAX_DOUBLINGS="${PREWARM_TASKS_MAX_DOUBLINGS:-2}"
 PREWARM_TASKS_MAX_RETRY_DURATION="${PREWARM_TASKS_MAX_RETRY_DURATION:-1200s}"
 
-WIKI_REBUILD_TASKS_MAX_DISPATCHES_PER_SECOND="${WIKI_REBUILD_TASKS_MAX_DISPATCHES_PER_SECOND:-0.5}"
-WIKI_REBUILD_TASKS_MAX_CONCURRENT_DISPATCHES="${WIKI_REBUILD_TASKS_MAX_CONCURRENT_DISPATCHES:-2}"
+WIKI_REBUILD_TASKS_MAX_DISPATCHES_PER_SECOND="${WIKI_REBUILD_TASKS_MAX_DISPATCHES_PER_SECOND:-0.2}"
+WIKI_REBUILD_TASKS_MAX_CONCURRENT_DISPATCHES="${WIKI_REBUILD_TASKS_MAX_CONCURRENT_DISPATCHES:-1}"
 WIKI_REBUILD_TASKS_MAX_ATTEMPTS="${WIKI_REBUILD_TASKS_MAX_ATTEMPTS:-4}"
 WIKI_REBUILD_TASKS_MIN_BACKOFF="${WIKI_REBUILD_TASKS_MIN_BACKOFF:-60s}"
 WIKI_REBUILD_TASKS_MAX_BACKOFF="${WIKI_REBUILD_TASKS_MAX_BACKOFF:-300s}"
@@ -453,8 +459,11 @@ gcloud run deploy "${SERVICE_NAME}" \
   --source . \
   --service-account "${RUN_SA}" \
   --timeout "${CLOUD_RUN_TIMEOUT_SECONDS}" \
-  --memory 1Gi \
-  --cpu 1 \
+  --memory "${CLOUD_RUN_MEMORY}" \
+  --cpu "${CLOUD_RUN_CPU}" \
+  --min-instances "${CLOUD_RUN_MIN_INSTANCES}" \
+  --max-instances "${CLOUD_RUN_MAX_INSTANCES}" \
+  --concurrency "${CLOUD_RUN_CONCURRENCY}" \
   --allow-unauthenticated \
   --env-vars-file "${ENV_VARS_FILE}" \
   --set-secrets "${SET_SECRETS}"
@@ -494,6 +503,7 @@ if [[ "${CREATE_SCHEDULER_JOBS}" == "true" ]]; then
         --project "${PROJECT_ID}" \
         --location "${REGION}" \
         --schedule="${schedule}" \
+        --time-zone="${SCHEDULER_TIME_ZONE}" \
         --uri="${SERVICE_URL}${path}" \
         --http-method=POST \
         --oidc-service-account-email="${SCHEDULER_SA}" \
@@ -503,11 +513,15 @@ if [[ "${CREATE_SCHEDULER_JOBS}" == "true" ]]; then
         --project "${PROJECT_ID}" \
         --location "${REGION}" \
         --schedule="${schedule}" \
+        --time-zone="${SCHEDULER_TIME_ZONE}" \
         --uri="${SERVICE_URL}${path}" \
         --http-method=POST \
         --oidc-service-account-email="${SCHEDULER_SA}" \
         --oidc-token-audience="${SERVICE_URL}"
     fi
+    gcloud scheduler jobs resume "${job_name}" \
+      --project "${PROJECT_ID}" \
+      --location "${REGION}" >/dev/null || true
   }
 
   create_or_update_job "${DRIVE_CHANGES_JOB_NAME}" "*/1 * * * *" "/admin/sync-drive-changes"
@@ -546,8 +560,10 @@ Drive root folder name: ${GOOGLE_DRIVE_ROOT_FOLDER_NAME}
 Run service account: ${RUN_SA}
 Scheduler service account: ${SCHEDULER_SA}
 Scheduler jobs created: ${CREATE_SCHEDULER_JOBS}
+Scheduler time zone: ${SCHEDULER_TIME_ZONE}
 Firestore indexes ensured: ${ENSURE_FIRESTORE_INDEXES}
 Cloud Run timeout seconds: ${CLOUD_RUN_TIMEOUT_SECONDS}
+Cloud Run resources: cpu=${CLOUD_RUN_CPU}, memory=${CLOUD_RUN_MEMORY}, min=${CLOUD_RUN_MIN_INSTANCES}, max=${CLOUD_RUN_MAX_INSTANCES}, concurrency=${CLOUD_RUN_CONCURRENCY}
 Upload base URL: ${SERVICE_URL}
 Upload token secret: ${UPLOAD_TOKEN_SECRET_NAME}
 Callback worker mode: ${CALLBACK_WORKER_MODE}
